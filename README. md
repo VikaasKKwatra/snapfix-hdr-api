@@ -1,0 +1,2 @@
+# snapfix-hdr-api
+HDR bracket merge API (FastAPI + Redis worker).
