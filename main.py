@@ -48,3 +48,9 @@ def get_result(job_id: str):
 @app.get("/health")
 def health():
     return {"ok": True}
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
