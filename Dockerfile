@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app
 
 # railway uses PORT for web service
-ENV PORT=8000
+
 
 # default command (web) – worker will override this in Railway start command
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
