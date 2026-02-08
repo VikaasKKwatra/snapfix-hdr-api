@@ -45,3 +45,6 @@ def get_result(job_id: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Not ready")
     return FileResponse(path, media_type="image/jpeg", filename=f"{job_id}.jpg")
+@app.get("/health")
+def health():
+    return {"ok": True}
