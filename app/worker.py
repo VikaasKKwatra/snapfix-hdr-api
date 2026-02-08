@@ -26,9 +26,15 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
 
 def download_image(url):
     """Download image from URL and return as OpenCV array"""
-    resp = urlopen(url)
-    image_data = np.asarray(bytearray(resp.read()), dtype=np.uint8)
+    import requests
+    from io import BytesIO
+    
+    print(f"Downloading from URL: {url[:100]}...")  # Debug log
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    image_data = np.asarray(bytearray(response.content), dtype=np.uint8)
     return cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
 
 def merge_hdr_mertens(images):
     """Merge bracketed images using Mertens fusion (no exposure times needed)"""
