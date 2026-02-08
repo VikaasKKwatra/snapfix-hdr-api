@@ -1,15 +1,18 @@
 import os
 import redis
-from rq import Queue
-from rq.worker import Worker
+from rq import Worker, Queue
 
 def main():
-    redis_url = os.environ["REDIS_URL"]  # must exist in Railway variables
+    redis_url = os.getenv("REDIS_URL") or os.getenv("REDIS_PRIVATE_URL") or os.getenv("REDIS_PUBLIC_URL")
+    if not redis_url:
+        raise RuntimeError("Missing REDIS_URL (or REDIS_PRIVATE_URL / REDIS_PUBLIC_URL)")
+
     conn = redis.from_url(redis_url)
 
-    queue = Queue("default", connection=conn)
-    worker = Worker([queue], connection=conn)
+    queue_name = os.getenv("RQ_QUEUE", "default")
+    q = Queue(queue_name, connection=conn)
 
+    worker = Worker([q], connection=conn)
     worker.work()
 
 if __name__ == "__main__":
