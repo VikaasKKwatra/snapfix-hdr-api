@@ -1,12 +1,16 @@
 import os
+import io
+import cv2
+import numpy as np
 import redis
 import requests
 from rq import Worker, Queue
+from urllib.request import urlopen
 
 def notify_callback(callback_url, job_id, status, output_url=None, error=None):
     """Send webhook notification when job completes"""
     if not callback_url:
-        print(f"No callback URL for job {job_id}, skipping notification")
+        print(f"No callback URL for job {job_id}")
         return
     
     try:
@@ -20,8 +24,22 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
     except Exception as e:
         print(f"Callback failed for {job_id}: {e}")
 
+def download_image(url):
+    """Download image from URL and return as OpenCV array"""
+    resp = urlopen(url)
+    image_data = np.asarray(bytearray(resp.read()), dtype=np.uint8)
+    return cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
+def merge_hdr_mertens(images):
+    """Merge bracketed images using Mertens fusion (no exposure times needed)"""
+    merge_mertens = cv2.createMergeMertens()
+    fusion = merge_mertens.process(images)
+    # Convert to 8-bit
+    fusion_8bit = np.clip(fusion * 255, 0, 255).astype(np.uint8)
+    return fusion_8bit
+
 def process_job(job_data):
-    """Process HDR merge job - called by RQ worker"""
+    """Process HDR merge job"""
     job_id = job_data["jobId"]
     input_urls = job_data["inputUrls"]
     style = job_data.get("style", "natural")
@@ -30,15 +48,45 @@ def process_job(job_data):
     print(f"Processing job {job_id} with {len(input_urls)} images, style: {style}")
     
     try:
-        # TODO: Add your HDR processing logic here
-        # 1. Download images from input_urls
-        # 2. Merge them using your HDR algorithm  
-        # 3. Upload result and get output_url
+        # Download all images
+        images = []
+        for i, url in enumerate(input_urls):
+            print(f"Downloading image {i+1}/{len(input_urls)}")
+            img = download_image(url)
+            if img is not None:
+                images.append(img)
         
-        output_url = "YOUR_RESULT_URL"  # Replace with actual result
+        if len(images) < 2:
+            raise ValueError(f"Need at least 2 images, got {len(images)}")
         
-        # Notify success
+        print(f"Merging {len(images)} images...")
+        
+        # Merge HDR using Mertens algorithm
+        result = merge_hdr_mertens(images)
+        
+        # Apply style adjustments
+        if style == "detailed":
+            # Increase local contrast
+            lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+        
+        # Encode to JPEG
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+        _, buffer = cv2.imencode('.jpg', result, encode_params)
+        
+        # Convert to base64 data URL
+        import base64
+        b64 = base64.b64encode(buffer).decode('utf-8')
+        output_url = f"data:image/jpeg;base64,{b64}"
+        
+        print(f"Job {job_id} completed successfully")
+        
+        # Notify via webhook
         notify_callback(callback_url, job_id, "completed", output_url=output_url)
+        
         return {"status": "completed", "outputUrl": output_url}
         
     except Exception as e:
@@ -49,7 +97,7 @@ def process_job(job_data):
 def main():
     redis_url = os.getenv("REDIS_URL") or os.getenv("REDIS_PRIVATE_URL") or os.getenv("REDIS_PUBLIC_URL")
     if not redis_url:
-        raise RuntimeError("Missing REDIS_URL (or REDIS_PRIVATE_URL / REDIS_PUBLIC_URL)")
+        raise RuntimeError("Missing REDIS_URL")
     
     conn = redis.from_url(redis_url)
     queue_name = os.getenv("RQ_QUEUE", "default")
