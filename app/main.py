@@ -27,8 +27,10 @@ class JobRequest(BaseModel):
 def health():
     return {"ok": True}
 
-@app.post("/v1/hdr/jobs")
-def create_job(req: JobRequest, x_api_key: str = "", _=Depends(lambda: require_api_key(x_api_key))):
+@app.post("/v1/hdr/jobs")@app.post("/v1/hdr/jobs")
+def create_job(req: JobRequest, x_api_key: str = ""):
+    require_api_key(x_api_key)
+
     if not REDIS_URL:
         raise HTTPException(status_code=500, detail="REDIS_URL missing on server.")
 
