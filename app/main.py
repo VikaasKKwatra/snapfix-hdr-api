@@ -27,7 +27,7 @@ class JobRequest(BaseModel):
 def health():
     return {"ok": True}
 
-@app.post("/v1/hdr/jobs")@app.post("/v1/hdr/jobs")
+@app.post("/v1/hdr/jobs")
 def create_job(req: JobRequest, x_api_key: str = ""):
     require_api_key(x_api_key)
 
