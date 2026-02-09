@@ -24,7 +24,7 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
     except Exception as e:
         print(f"Callback failed for {job_id}: {e}")
     
- def download_image(url):
+def download_image(url):
     """Download image from URL and return as OpenCV array"""
     url = str(url)  # IMPORTANT: HttpUrl -> string
 
@@ -34,8 +34,8 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
     response.raise_for_status()
 
     image_data = np.asarray(bytearray(response.content), dtype=np.uint8)
-    return cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-
+    img = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+    return img
 
 
 
