@@ -38,6 +38,7 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
 
 
 
+
 def merge_hdr_mertens(images):
     """Merge bracketed images using Mertens fusion (no exposure times needed)"""
     merge_mertens = cv2.createMergeMertens()
@@ -49,7 +50,7 @@ def merge_hdr_mertens(images):
 def process_job(job_data):
     """Process HDR merge job"""
     job_id = job_data["jobId"]
-    input_urls = job_data["inputUrls"]
+    input_urls = [str(u) for u in job_data["inputUrls"]]
     style = job_data.get("style", "natural")
     callback_url = job_data.get("callbackUrl")
     
