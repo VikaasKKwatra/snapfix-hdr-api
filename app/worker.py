@@ -24,17 +24,16 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
     except Exception as e:
         print(f"Callback failed for {job_id}: {e}")
     
-   def download_image(url):
-    """Download image from URL and return as OpenCV array"""
-    import requests
-    url = str(url)  # <-- IMPORTANT: convert HttpUrl -> string
+  def download_image(url):
+    url = str(url)  # ✅ convert HttpUrl -> string
 
-    print(f"Downloading from URL: {url[:100]}...")  # Debug log
+    print(f"Downloading from URL: {url[:100]}...")  # now safe
     response = requests.get(url, timeout=60)
     response.raise_for_status()
 
     image_data = np.asarray(bytearray(response.content), dtype=np.uint8)
     return cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
 
 
 
@@ -50,9 +49,12 @@ def merge_hdr_mertens(images):
 def process_job(job_data):
     """Process HDR merge job"""
     job_id = job_data["jobId"]
-    input_urls = [str(u) for u in job_data["inputUrls"]]
+    input_urls = [str(u) for u in job_data["inputUrls"]]  # ✅ force strings
     style = job_data.get("style", "natural")
-    callback_url = job_data.get("callbackUrl")
+   callback_url = job_data.get("callbackUrl")
+if callback_url is not None:
+    callback_url = str(callback_url)
+
     
     print(f"Processing job {job_id} with {len(input_urls)} images, style: {style}")
     
