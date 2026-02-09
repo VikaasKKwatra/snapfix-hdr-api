@@ -25,13 +25,16 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
         print(f"Callback failed for {job_id}: {e}")
     
  def download_image(url):
-    url = str(url)  # IMPORTANT: HttpUrl -> string
-    print(f"Downloading from URL: {url[:100]}...")
+    """Download image from URL and return as OpenCV array"""
+    url = str(url)  # IMPORTANT: convert HttpUrl -> string
+
+    print(f"Downloading from URL: {url[:100]}...")  # now safe
+
     response = requests.get(url, timeout=60)
     response.raise_for_status()
+
     image_data = np.asarray(bytearray(response.content), dtype=np.uint8)
     return cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-
 
 
 
