@@ -54,14 +54,13 @@ def process_job(job_data):
     input_urls = [str(u) for u in job_data["inputUrls"]]  # force strings
     style = str(job_data.get("style", "natural"))
 
-    callback_url = job_data.get("callbackUrl")
+    callback_url = job_data.get("callbackUrl", None)
     if callback_url is not None:
         callback_url = str(callback_url)
 
     print(f"Processing job {job_id} with {len(input_urls)} images, style: {style}")
 
     try:
-        # Download all images
         images = []
         for i, url in enumerate(input_urls):
             print(f"Downloading image {i+1}/{len(input_urls)}")
@@ -73,11 +72,8 @@ def process_job(job_data):
             raise ValueError(f"Need at least 2 images, got {len(images)}")
 
         print(f"Merging {len(images)} images...")
-
-        # Merge HDR using Mertens algorithm
         result = merge_hdr_mertens(images)
 
-        # Apply style adjustments
         if style == "detailed":
             lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
@@ -85,20 +81,17 @@ def process_job(job_data):
             l = clahe.apply(l)
             result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-        # Encode to JPEG
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95]
         ok, buffer = cv2.imencode(".jpg", result, encode_params)
         if not ok:
-            raise RuntimeError("Failed to encode output image")
+            raise RuntimeError("Failed to encode JPG")
 
-        # Convert to base64 data URL
         import base64
         b64 = base64.b64encode(buffer).decode("utf-8")
         output_url = f"data:image/jpeg;base64,{b64}"
 
         print(f"Job {job_id} completed successfully")
 
-        # Notify via webhook (only if callback_url provided)
         if callback_url:
             notify_callback(callback_url, job_id, "completed", output_url=output_url)
 
@@ -109,6 +102,7 @@ def process_job(job_data):
         if callback_url:
             notify_callback(callback_url, job_id, "failed", error=str(e))
         raise
+
 
 
 def main():
