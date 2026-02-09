@@ -34,7 +34,8 @@ def create_job(req: JobRequest, x_api_key: str = "", _=Depends(lambda: require_a
 
     r = redis.from_url(REDIS_URL)
     q = Queue(QUEUE_NAME, connection=r)
-    q.enqueue("app.worker.process_job", req.model_dump())
+    q.enqueue(process_job, job_data, job_id=job_data["jobId"])
+
 
     return {"accepted": True, "jobId": req.jobId, "status": "QUEUED"}
 
