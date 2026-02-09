@@ -23,17 +23,19 @@ def notify_callback(callback_url, job_id, status, output_url=None, error=None):
         print(f"Callback sent for {job_id}: {status} (HTTP {response.status_code})")
     except Exception as e:
         print(f"Callback failed for {job_id}: {e}")
-
-def download_image(url):
+    
+   def download_image(url):
     """Download image from URL and return as OpenCV array"""
     import requests
-    from io import BytesIO
-    
+    url = str(url)  # <-- IMPORTANT: convert HttpUrl -> string
+
     print(f"Downloading from URL: {url[:100]}...")  # Debug log
     response = requests.get(url, timeout=60)
     response.raise_for_status()
+
     image_data = np.asarray(bytearray(response.content), dtype=np.uint8)
     return cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
 
 
 def merge_hdr_mertens(images):
