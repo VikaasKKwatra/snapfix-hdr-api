@@ -90,26 +90,32 @@ def window_pull(images: list[np.ndarray], fused: np.ndarray) -> np.ndarray:
 
 
 def color_correction(img: np.ndarray) -> np.ndarray:
+    """Light color correction - only fix extreme casts, preserve warm tones."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     avg_a = np.mean(lab[:, :, 1])
     avg_b = np.mean(lab[:, :, 2])
     a_shift = 128 - avg_a
     b_shift = 128 - avg_b
-    correction_strength = 0.5
-    lab[:, :, 1] += a_shift * correction_strength
-    lab[:, :, 2] += b_shift * correction_strength
+    # Only correct if there's a strong cast (shift > 5)
+    # Use very light strength to preserve natural warmth
+    correction_strength = 0.2
+    if abs(a_shift) > 5:
+        lab[:, :, 1] += a_shift * correction_strength
+    if abs(b_shift) > 5:
+        lab[:, :, 2] += b_shift * correction_strength
     lab = np.clip(lab, 0, 255).astype(np.uint8)
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-def smart_sharpen(img: np.ndarray, strength: float = 0.4) -> np.ndarray:
+def smart_sharpen(img: np.ndarray, strength: float = 0.5) -> np.ndarray:
     blurred = cv2.GaussianBlur(img, (0, 0), 2.0)
     sharpened = cv2.addWeighted(img, 1.0 + strength, blurred, -strength, 0)
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
 def denoise_light(img: np.ndarray) -> np.ndarray:
-    return cv2.fastNlMeansDenoisingColored(img, None, 3, 3, 7, 21)
+    # h=2 (very light denoise to preserve detail)
+    return cv2.fastNlMeansDenoisingColored(img, None, 2, 2, 7, 21)
 
 
 def process_job(data: dict):
@@ -145,15 +151,15 @@ def process_job(data: dict):
 
         logger.info(f"[{job_id}] Applying CLAHE...")
         lab = cv2.cvtColor(corrected, cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(16, 16))
         lab[:, :, 0] = clahe.apply(lab[:, :, 0])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
         logger.info(f"[{job_id}] Denoising and sharpening...")
         denoised = denoise_light(enhanced)
-        final = smart_sharpen(denoised, strength=0.4)
+        final = smart_sharpen(denoised, strength=0.5)
 
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 97]
         _, buffer = cv2.imencode('.jpg', final, encode_params)
         result_b64 = base64.b64encode(buffer).decode('utf-8')
 
