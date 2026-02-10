@@ -22,25 +22,20 @@ JPEG_QUALITY = 97
 
 def detect_scene_type(images):
     """Detect if scene is interior or exterior based on image characteristics."""
-    # Use the normal exposure (middle) image for detection
     img = images[len(images) // 2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # Check top 30% of image for sky-like colors
     top_portion = h[:img.shape[0] // 3, :]
     top_s = s[:img.shape[0] // 3, :]
     top_v = v[:img.shape[0] // 3, :]
 
-    # Sky detection: blue hues (90-130), moderate saturation, high value
     sky_mask = ((top_portion > 85) & (top_portion < 135) &
                 (top_s > 30) & (top_v > 100))
     sky_ratio = np.sum(sky_mask) / sky_mask.size
 
-    # High brightness in top portion suggests exterior
     avg_top_brightness = np.mean(top_v)
 
-    # Green detection for lawns/trees
     green_mask = ((h > 30) & (h < 85) & (s > 30))
     green_ratio = np.sum(green_mask) / green_mask.size
 
@@ -169,16 +164,14 @@ def exposure_fusion(images, scene_type="interior"):
     mid = n // 2
 
     if scene_type == "exterior":
-        # Exterior: favor darker exposure to preserve sky detail
         weights = np.ones(n, dtype=np.float32)
-        weights[0] = 1.4   # dark (sky detail)
-        weights[mid] = 1.0  # normal
-        weights[-1] = 0.7   # bright (often blown sky)
+        weights[0] = 1.4
+        weights[mid] = 1.0
+        weights[-1] = 0.7
     else:
-        # Interior: favor middle frame, use bright for shadow detail
         weights = np.ones(n, dtype=np.float32)
         weights[mid] = 1.3
-        weights[-1] = 1.1  # bright frame for shadow recovery
+        weights[-1] = 1.1
         weights[0] = 0.8
 
     weighted = []
@@ -194,14 +187,12 @@ def exposure_fusion(images, scene_type="interior"):
 
 # ─── Tone Mapping ────────────────────────────────────────────────────
 
-def apply_s_curve(img, strength=0.6):
+def apply_s_curve(img, strength=0.45):
     """S-curve sigmoid contrast for cinematic look."""
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         x = i / 255.0
-        # Sigmoid centered at 0.5
         curved = 1.0 / (1.0 + np.exp(-((x - 0.5) * 10 * strength)))
-        # Blend with linear
         blended = x * (1 - strength * 0.5) + curved * (strength * 0.5)
         lut[i] = np.clip(int(blended * 255), 0, 255)
 
@@ -210,7 +201,7 @@ def apply_s_curve(img, strength=0.6):
     return result
 
 
-def apply_gamma(img, gamma=0.88):
+def apply_gamma(img, gamma=0.93):
     """Gamma correction for brightness punch."""
     inv_gamma = 1.0 / gamma
     table = np.array([(i / 255.0) ** inv_gamma * 255
@@ -229,23 +220,19 @@ def apply_edge_aware_contrast(img, scene_type="interior"):
     l_channel, a_channel, b_channel = cv2.split(lab)
     l_float = l_channel.astype(np.float32) / 255.0
 
-    # Use the L channel itself as guide to preserve edges
     radius = 16 if scene_type == "interior" else 20
     eps = 0.01 if scene_type == "interior" else 0.02
 
-    # Guided filter approximation using bilateral filter
     base = cv2.bilateralFilter(l_float, d=radius, sigmaColor=0.1, sigmaSpace=radius)
     detail = l_float - base
 
-    # Boost detail layer — stronger for interiors, gentler for exteriors
     if scene_type == "interior":
         detail_boost = 1.5
     else:
         detail_boost = 1.3
 
-    # Adaptive: boost shadows more, protect highlights
-    shadow_mask = np.clip(1.0 - base, 0, 1) ** 0.5  # stronger in shadows
-    highlight_mask = np.clip(base - 0.7, 0, 0.3) / 0.3  # detect highlights
+    shadow_mask = np.clip(1.0 - base, 0, 1) ** 0.5
+    highlight_mask = np.clip(base - 0.7, 0, 0.3) / 0.3
 
     boosted_detail = detail * (detail_boost + shadow_mask * 0.3 - highlight_mask * 0.3)
 
@@ -261,7 +248,6 @@ def apply_edge_aware_contrast(img, scene_type="interior"):
 def estimate_noise_level(img):
     """Estimate image noise level using Laplacian variance method."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Use a small crop from center to avoid edges skewing the estimate
     h, w = gray.shape
     crop = gray[h // 4:3 * h // 4, w // 4:3 * w // 4]
     sigma = np.sqrt(np.maximum(cv2.Laplacian(crop, cv2.CV_64F).var() * 0.5, 0))
@@ -280,22 +266,18 @@ def apply_adaptive_denoising(img):
         print(f"  [Denoise] Clean image — skipping denoising")
         return img
     elif noise_level < 15:
-        # Light denoising
         h_lum = 2
         h_color = 2
         print(f"  [Denoise] Light denoising (h={h_lum})")
     elif noise_level < 30:
-        # Moderate denoising
         h_lum = 4
         h_color = 3
         print(f"  [Denoise] Moderate denoising (h={h_lum})")
     else:
-        # Heavy denoising
         h_lum = 7
         h_color = 5
         print(f"  [Denoise] Heavy denoising (h={h_lum})")
 
-    # Use positional arguments for OpenCV compatibility
     result = cv2.fastNlMeansDenoisingColored(img, None, h_lum, h_color, 7, 21)
     return result
 
@@ -310,16 +292,13 @@ def apply_auto_white_balance(img, scene_type="interior"):
     img_float = img.astype(np.float32)
     b, g, r = cv2.split(img_float)
 
-    # Gray-world assumption: average of each channel should be equal
     avg_b, avg_g, avg_r = np.mean(b), np.mean(g), np.mean(r)
     avg_all = (avg_b + avg_g + avg_r) / 3.0
 
-    # Calculate correction factors
     scale_b = avg_all / (avg_b + 1e-6)
     scale_g = avg_all / (avg_g + 1e-6)
     scale_r = avg_all / (avg_r + 1e-6)
 
-    # Clamp to prevent extreme corrections
     max_correction = 1.25 if scene_type == "interior" else 1.15
     min_correction = 1.0 / max_correction
 
@@ -327,8 +306,9 @@ def apply_auto_white_balance(img, scene_type="interior"):
     scale_g = np.clip(scale_g, min_correction, max_correction)
     scale_r = np.clip(scale_r, min_correction, max_correction)
 
-    # Apply with reduced strength to stay natural (60% correction)
-    strength = 0.6 if scene_type == "interior" else 0.4
+    # FIX 3: Reduced strength to prevent warm shift on cool-toned floors
+    strength = 0.35 if scene_type == "interior" else 0.25
+
     scale_b = 1.0 + (scale_b - 1.0) * strength
     scale_g = 1.0 + (scale_g - 1.0) * strength
     scale_r = 1.0 + (scale_r - 1.0) * strength
@@ -354,12 +334,12 @@ def apply_color_correction_pro(img, scene_type="interior"):
     a_float = a.astype(np.float32)
     b_float = b.astype(np.float32)
 
-    # Push toward neutral (128 is neutral in LAB a/b)
-    neutral_strength = 0.20 if scene_type == "interior" else 0.12
+    # FIX 5: Reduced neutral push to preserve cool gray tones
+    neutral_strength = 0.10 if scene_type == "interior" else 0.08
+
     a_corrected = a_float + (128.0 - a_float) * neutral_strength
     b_corrected = b_float + (128.0 - b_float) * neutral_strength
 
-    # Vibrance: boost low-saturation pixels more than already-saturated ones
     chroma = np.sqrt((a_float - 128) ** 2 + (b_float - 128) ** 2)
     max_chroma = np.percentile(chroma, 95) + 1e-6
     vibrance_mask = 1.0 - np.clip(chroma / max_chroma, 0, 1)
@@ -383,14 +363,14 @@ def apply_shadow_highlight_recovery(img, scene_type="interior"):
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    # Shadow lift (quadratic for natural feel)
-    shadow_threshold = 0.35 if scene_type == "interior" else 0.25
-    shadow_strength = 0.25 if scene_type == "interior" else 0.15
+    # FIX 4: Stronger shadow recovery for dark areas like stairways
+    shadow_threshold = 0.45 if scene_type == "interior" else 0.30
+    shadow_strength = 0.35 if scene_type == "interior" else 0.20
+
     shadow_mask = np.clip((shadow_threshold - l_float) / shadow_threshold, 0, 1)
     shadow_lift = shadow_mask ** 2 * shadow_strength
     l_float = l_float + shadow_lift
 
-    # Highlight rolloff
     highlight_threshold = 0.92
     highlight_mask = np.clip((l_float - highlight_threshold) / (1.0 - highlight_threshold), 0, 1)
     l_float = l_float - highlight_mask * 0.08
@@ -413,7 +393,6 @@ def apply_final_brightness_contrast(img):
 
     result = img.copy()
 
-    # Fix if too dark
     if mean_brightness < 90:
         boost = min((100 - mean_brightness) / 100 * 0.15, 0.12)
         lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
@@ -422,7 +401,6 @@ def apply_final_brightness_contrast(img):
         result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
         print(f"  [Brightness] Boosted by {boost:.1%}")
 
-    # Fix if too bright
     elif mean_brightness > 190:
         reduce = min((mean_brightness - 180) / 100 * 0.1, 0.08)
         lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
@@ -443,20 +421,16 @@ def apply_pro_sharpening(img):
 
     l_float = l_channel.astype(np.float32)
 
-    # Fine detail sharpening (radius ~1px)
     blur_fine = cv2.GaussianBlur(l_float, (3, 3), 0.8)
     detail_fine = l_float - blur_fine
 
-    # Medium detail sharpening (radius ~2px)
     blur_med = cv2.GaussianBlur(l_float, (5, 5), 1.5)
     detail_med = l_float - blur_med
 
-    # Halo prevention — clamp detail magnitude
     max_detail = 12.0
     detail_fine = np.clip(detail_fine, -max_detail, max_detail)
     detail_med = np.clip(detail_med, -max_detail, max_detail)
 
-    # Blend: strong fine + moderate medium
     sharpened = l_float + detail_fine * 1.2 + detail_med * 0.4
     sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
 
@@ -480,7 +454,7 @@ def apply_perspective_correction(img):
     angles = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
-        if abs(x2 - x1) < abs(y2 - y1):  # near-vertical lines
+        if abs(x2 - x1) < abs(y2 - y1):
             angle = np.degrees(np.arctan2(x2 - x1, y2 - y1))
             if abs(angle) < 5:
                 angles.append(angle)
@@ -529,10 +503,10 @@ def process_hdr(images, style="natural"):
     print("[Step 4/9] Auto white balance...")
     merged = apply_auto_white_balance(merged, scene_type)
 
-    # 6. Tone mapping
+    # 6. Tone mapping — FIX 1 & 2: softer S-curve and gamma
     print("[Step 5/9] Tone mapping (S-curve + gamma)...")
-    merged = apply_s_curve(merged, strength=0.55 if scene_type == "exterior" else 0.6)
-    merged = apply_gamma(merged, gamma=0.90 if scene_type == "exterior" else 0.88)
+    merged = apply_s_curve(merged, strength=0.45 if scene_type == "exterior" else 0.45)
+    merged = apply_gamma(merged, gamma=0.95 if scene_type == "exterior" else 0.93)
 
     # 7. Edge-aware contrast
     print("[Step 6/9] Edge-aware contrast enhancement...")
@@ -581,7 +555,6 @@ def process_job(payload):
     print(f"{'='*60}")
 
     try:
-        # Download input images
         images = []
         for i, url in enumerate(input_urls):
             print(f"[Job {job_id}] Downloading image {i+1}/{len(input_urls)}...")
@@ -597,10 +570,8 @@ def process_job(payload):
         if len(images) < 2:
             raise ValueError("Need at least 2 images for HDR merge")
 
-        # Process
         result = process_hdr(images, style)
 
-        # Encode result
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         success, encoded = cv2.imencode(".jpg", result, encode_params)
         if not success:
@@ -609,7 +580,6 @@ def process_job(payload):
         result_bytes = encoded.tobytes()
         print(f"[Job {job_id}] Result: {len(result_bytes)/1024:.0f}KB")
 
-        # Send webhook callback
         if webhook_url:
             import base64
             result_b64 = base64.b64encode(result_bytes).decode("utf-8")
@@ -643,7 +613,6 @@ def process_job(payload):
         print(f"[Job {job_id}] ❌ Error: {error_msg}")
         traceback.print_exc()
 
-        # Send error webhook
         if webhook_url:
             try:
                 error_payload = {
