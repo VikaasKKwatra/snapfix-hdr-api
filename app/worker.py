@@ -1,6 +1,6 @@
 """
 Snapfix HDR Worker – Professional Real Estate HDR Processing Engine
-v5.2 – Balanced warmth preservation + natural wood tones
+v5.2 – Balanced warmth preservation + natural wood tones + webhook compression
 """
 
 import io
@@ -190,13 +190,11 @@ def apply_lab_tone_mapping(img, scene_type="interior"):
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    # Gentler S-curve to preserve natural tones
     s_strength = 0.42 if scene_type == "exterior" else 0.35
     x = l_float
     curved = 1.0 / (1.0 + np.exp(-((x - 0.5) * 10 * s_strength)))
     l_float = x * (1 - s_strength * 0.5) + curved * (s_strength * 0.5)
 
-    # Gamma on luminance only
     gamma = 0.93 if scene_type == "exterior" else 0.95
     l_float = np.power(np.clip(l_float, 0, 1), 1.0 / gamma)
 
@@ -325,13 +323,13 @@ def apply_adaptive_denoising(img):
     return result
 
 
-# ─── Auto White Balance (warm-clamped but allowing natural warmth) ───
+# ─── Auto White Balance (gentle warm-clamp) ─────────────────────────
 
 def apply_auto_white_balance(img, scene_type="interior"):
     """
     Gentle WB: allows natural wood/material warmth through while
-    preventing artificial warm casts. Key: scale_r capped at 1.03
-    instead of 1.0, and overall strength reduced to 0.12.
+    preventing artificial warm casts. scale_r capped at 1.03,
+    overall strength reduced to 0.12.
     """
     img_float = img.astype(np.float32)
     b, g, r = cv2.split(img_float)
@@ -350,7 +348,6 @@ def apply_auto_white_balance(img, scene_type="interior"):
     scale_g = np.clip(scale_g, min_correction, max_correction)
     scale_r = np.clip(scale_r, min_correction, max_correction)
 
-    # Reduced strength — less interference with natural tones
     strength = 0.12 if scene_type == "interior" else 0.20
 
     scale_b = 1.0 + (scale_b - 1.0) * strength
@@ -358,10 +355,9 @@ def apply_auto_white_balance(img, scene_type="interior"):
     scale_r = 1.0 + (scale_r - 1.0) * strength
 
     # SOFT WARM CLAMP: allow slight natural warmth (up to 1.03)
-    # but prevent strong warm shifts
     if scene_type == "interior":
-        scale_r = min(scale_r, 1.03)  # allow slight warmth
-        scale_b = max(scale_b, 0.98)  # allow slight blue reduction
+        scale_r = min(scale_r, 1.03)
+        scale_b = max(scale_b, 0.98)
 
     corrected = cv2.merge([
         np.clip(b * scale_b, 0, 255),
@@ -374,13 +370,12 @@ def apply_auto_white_balance(img, scene_type="interior"):
     return corrected
 
 
-# ─── Color Correction (preserving natural material tones) ────────────
+# ─── Color Correction (material-aware) ──────────────────────────────
 
 def apply_color_correction_pro(img, scene_type="interior"):
     """
-    Selective neutral push with higher neutral threshold (12.0).
-    Wood floors and warm cabinets have low-but-not-zero chroma —
-    they need to be PRESERVED, not pushed toward gray.
+    Selective neutral push with higher threshold (12.0).
+    Wood floors and warm cabinets are PRESERVED, not pushed toward gray.
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
@@ -388,20 +383,15 @@ def apply_color_correction_pro(img, scene_type="interior"):
     a_float = a.astype(np.float32)
     b_float = b.astype(np.float32)
 
-    # Measure how far each pixel is from neutral (128, 128)
     chroma = np.sqrt((a_float - 128) ** 2 + (b_float - 128) ** 2)
 
-    # Higher threshold: wood/warm materials (chroma 5-12) are EXCLUDED
-    # Only pixels with strong cast (chroma > 12) get corrected
     neutral_threshold = 12.0 if scene_type == "interior" else 8.0
     cast_mask = np.clip((chroma - neutral_threshold) / 10.0, 0, 1)
 
-    # Light neutral push only on strongly cast pixels
     neutral_strength = 0.03 if scene_type == "interior" else 0.05
     a_corrected = a_float + (128.0 - a_float) * neutral_strength * cast_mask
     b_corrected = b_float + (128.0 - b_float) * neutral_strength * cast_mask
 
-    # Gentle vibrance
     max_chroma = np.percentile(chroma, 95) + 1e-6
     vibrance_mask = 1.0 - np.clip(chroma / max_chroma, 0, 1)
 
@@ -427,8 +417,8 @@ def apply_shadow_highlight_recovery(img, scene_type="interior"):
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    shadow_threshold = 0.35 if scene_type == "interior" else 0.30
-    shadow_strength = 0.18 if scene_type == "interior" else 0.15
+    shadow_threshold = 0.45 if scene_type == "interior" else 0.30
+    shadow_strength = 0.35 if scene_type == "interior" else 0.15
 
     shadow_mask = np.clip((shadow_threshold - l_float) / shadow_threshold, 0, 1)
     shadow_lift = shadow_mask ** 2 * shadow_strength
@@ -548,45 +538,35 @@ def process_hdr(images, style="natural"):
     print("[Step 2/9] Ghost removal...")
     deghosted = remove_ghosts(aligned)
 
-    # Capture floor reference from MIDDLE BRACKET (before fusion changes anything)
+    # Capture floor reference from MIDDLE BRACKET (before fusion)
     print("[Step 3/9] Capturing surface tone reference from source bracket...")
     floor_ref = capture_surface_reference(images[len(images) // 2])
 
     print("[Step 4/9] Exposure fusion...")
     merged = exposure_fusion(deghosted, scene_type)
 
-    # Gentle warm-clamped AWB
     print("[Step 5/9] White balance (gentle warm-clamp)...")
     merged = apply_auto_white_balance(merged, scene_type)
 
-    # LAB-only tone mapping — gentler
     print("[Step 6/9] LAB tone mapping...")
     merged = apply_lab_tone_mapping(merged, scene_type)
 
     print("[Step 7/9] Edge-aware contrast...")
     merged = apply_edge_aware_contrast(merged, scene_type)
 
-    # Neutral-zone color correction — higher threshold preserves wood
     print("[Step 8/9] Color correction (material-aware)...")
     merged = apply_color_correction_pro(merged, scene_type)
 
     print("[Step 9/9] Shadow/highlight recovery...")
     merged = apply_shadow_highlight_recovery(merged, scene_type)
 
-    # Denoising
     merged = apply_adaptive_denoising(merged)
-
-    # Brightness auto-fix
     merged = apply_final_brightness_contrast(merged)
 
-    # Restore floor tones from SOURCE bracket reference
     print("[Floor Restore] Checking for color drift vs source...")
     merged = restore_surface_tones(merged, floor_ref)
 
-    # Perspective correction
     merged = apply_perspective_correction(merged)
-
-    # LAB sharpening
     merged = apply_pro_sharpening(merged)
 
     elapsed = time.time() - t0
@@ -627,17 +607,27 @@ def process_job(payload):
 
         result = process_hdr(images, style)
 
+        # Full quality encode for final result
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         success, encoded = cv2.imencode(".jpg", result, encode_params)
         if not success:
             raise ValueError("Failed to encode result image")
 
         result_bytes = encoded.tobytes()
-        print(f"[Job {job_id}] Result: {len(result_bytes)/1024:.0f}KB")
+        print(f"[Job {job_id}] Result (full quality): {len(result_bytes)/1024:.0f}KB")
 
         if webhook_url:
             import base64
-            result_b64 = base64.b64encode(result_bytes).decode("utf-8")
+
+            # Re-compress for webhook transfer to prevent timeout
+            # The hdr-webhook edge function re-enhances with AI anyway
+            webhook_quality = 85
+            _, webhook_encoded = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, webhook_quality])
+            webhook_bytes = webhook_encoded.tobytes()
+            print(f"[Job {job_id}] Webhook payload: {len(webhook_bytes)/1024:.0f}KB "
+                  f"(compressed from {len(result_bytes)/1024:.0f}KB)")
+
+            result_b64 = base64.b64encode(webhook_bytes).decode("utf-8")
 
             callback_payload = {
                 "jobId": job_id,
@@ -695,5 +685,5 @@ if __name__ == "__main__":
     redis_conn = Redis.from_url(REDIS_URL)
     queue = Queue("hdr", connection=redis_conn)
     worker = Worker([queue], connection=redis_conn)
-    print("[Worker] Starting HDR worker v5.2 — balanced warmth + natural materials")
+    print("[Worker] Starting HDR worker v5.2 — balanced warmth + webhook compression")
     worker.work(with_scheduler=False)
