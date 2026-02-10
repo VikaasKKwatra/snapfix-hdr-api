@@ -109,8 +109,7 @@ def smart_sharpen(img: np.ndarray, strength: float = 0.4) -> np.ndarray:
 
 
 def denoise_light(img: np.ndarray) -> np.ndarray:
-    return cv2.fastNlMeansDenoisingColored(img, None, h=3, hForColorComponents=3,
-                                           templateWindowSize=7, searchWindowSize=21)
+    return cv2.fastNlMeansDenoisingColored(img, None, 3, 3, 7, 21)
 
 
 def process_job(data: dict):
