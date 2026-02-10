@@ -159,11 +159,10 @@ def process_job(data: dict):
     6. Light denoise + smart sharpen
     7. High-quality JPEG output
     """
-    job_id = data.get("job_id", "")
-    image_urls = data.get("image_urls", [])
-    style = data.get("style", "natural")
-    webhook_url = data.get("webhook_url")
-    webhook_secret = data.get("webhook_secret")
+    job_id = data.get("jobId", "") or data.get("job_id", "")
+image_urls = data.get("inputUrls", []) or data.get("input_urls", [])
+webhook_url = data.get("webhookUrl") or data.get("webhook_url")
+webhook_secret = data.get("webhookSecret") or data.get("webhook_secret")
 
     logger.info(f"[{job_id}] Starting HDR processing, {len(image_urls)} images, style={style}")
 
