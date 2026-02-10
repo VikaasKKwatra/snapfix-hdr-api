@@ -1,9 +1,0 @@
-fastapi
-uvicorn[standard]
-redis
-rq
-numpy
-opencv-python-headless
-pydantic
-requests
-python-multipart
