@@ -1,6 +1,6 @@
 """
 Snapfix HDR Worker – Professional Real Estate HDR Processing Engine
-v5.1 – LAB-only tone mapping + warm-clamped AWB + neutral-zone color correction
+v5.2 – Balanced warmth preservation + natural wood tones
 """
 
 import io
@@ -184,20 +184,20 @@ def exposure_fusion(images, scene_type="interior"):
 def apply_lab_tone_mapping(img, scene_type="interior"):
     """
     S-curve and gamma on L channel ONLY — a/b channels untouched.
-    This prevents RGB tone mapping from shifting warm channels.
+    Reduced strength to avoid desaturation of natural tones.
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    # S-curve on luminance only
-    s_strength = 0.45 if scene_type == "exterior" else 0.40
+    # Gentler S-curve to preserve natural tones
+    s_strength = 0.42 if scene_type == "exterior" else 0.35
     x = l_float
     curved = 1.0 / (1.0 + np.exp(-((x - 0.5) * 10 * s_strength)))
     l_float = x * (1 - s_strength * 0.5) + curved * (s_strength * 0.5)
 
     # Gamma on luminance only
-    gamma = 0.93 if scene_type == "exterior" else 0.94
+    gamma = 0.93 if scene_type == "exterior" else 0.95
     l_float = np.power(np.clip(l_float, 0, 1), 1.0 / gamma)
 
     l_out = np.clip(l_float * 255, 0, 255).astype(np.uint8)
@@ -211,7 +211,7 @@ def apply_lab_tone_mapping(img, scene_type="interior"):
 # ─── Floor/Surface Tone Preservation ────────────────────────────────
 
 def capture_surface_reference(img):
-    """Capture LAB color signature of floor region before processing."""
+    """Capture LAB color signature of floor region BEFORE any processing."""
     h, w = img.shape[:2]
     floor_region = img[int(h * 0.6):, :]
     lab = cv2.cvtColor(floor_region, cv2.COLOR_BGR2LAB)
@@ -282,12 +282,12 @@ def apply_edge_aware_contrast(img, scene_type="interior"):
     base = cv2.bilateralFilter(l_float, d=radius, sigmaColor=0.1, sigmaSpace=radius)
     detail = l_float - base
 
-    detail_boost = 1.5 if scene_type == "interior" else 1.3
+    detail_boost = 1.4 if scene_type == "interior" else 1.3
 
     shadow_mask = np.clip(1.0 - base, 0, 1) ** 0.5
     highlight_mask = np.clip(base - 0.7, 0, 0.3) / 0.3
 
-    boosted_detail = detail * (detail_boost + shadow_mask * 0.3 - highlight_mask * 0.3)
+    boosted_detail = detail * (detail_boost + shadow_mask * 0.2 - highlight_mask * 0.2)
 
     enhanced = base + boosted_detail
     enhanced = np.clip(enhanced * 255, 0, 255).astype(np.uint8)
@@ -325,12 +325,13 @@ def apply_adaptive_denoising(img):
     return result
 
 
-# ─── Auto White Balance (warm-clamped) ───────────────────────────────
+# ─── Auto White Balance (warm-clamped but allowing natural warmth) ───
 
 def apply_auto_white_balance(img, scene_type="interior"):
     """
-    Smart WB: corrects blue/green casts but CLAMPS warm-direction shifts.
-    This fixes tungsten yellow without pushing neutral gray floors warm.
+    Gentle WB: allows natural wood/material warmth through while
+    preventing artificial warm casts. Key: scale_r capped at 1.03
+    instead of 1.0, and overall strength reduced to 0.12.
     """
     img_float = img.astype(np.float32)
     b, g, r = cv2.split(img_float)
@@ -342,24 +343,25 @@ def apply_auto_white_balance(img, scene_type="interior"):
     scale_g = avg_all / (avg_g + 1e-6)
     scale_r = avg_all / (avg_r + 1e-6)
 
-    max_correction = 1.15
+    max_correction = 1.12
     min_correction = 1.0 / max_correction
 
     scale_b = np.clip(scale_b, min_correction, max_correction)
     scale_g = np.clip(scale_g, min_correction, max_correction)
     scale_r = np.clip(scale_r, min_correction, max_correction)
 
-    strength = 0.20 if scene_type == "interior" else 0.25
+    # Reduced strength — less interference with natural tones
+    strength = 0.12 if scene_type == "interior" else 0.20
 
     scale_b = 1.0 + (scale_b - 1.0) * strength
     scale_g = 1.0 + (scale_g - 1.0) * strength
     scale_r = 1.0 + (scale_r - 1.0) * strength
 
-    # WARM CLAMP: never boost Red or reduce Blue beyond 1.0
-    # This prevents gray floors from shifting toward brown/amber
+    # SOFT WARM CLAMP: allow slight natural warmth (up to 1.03)
+    # but prevent strong warm shifts
     if scene_type == "interior":
-        scale_r = min(scale_r, 1.0)   # never boost red
-        scale_b = max(scale_b, 1.0)   # never reduce blue
+        scale_r = min(scale_r, 1.03)  # allow slight warmth
+        scale_b = max(scale_b, 0.98)  # allow slight blue reduction
 
     corrected = cv2.merge([
         np.clip(b * scale_b, 0, 255),
@@ -368,16 +370,17 @@ def apply_auto_white_balance(img, scene_type="interior"):
     ]).astype(np.uint8)
 
     print(f"  [WB] Corrections — B: {scale_b:.3f}, G: {scale_g:.3f}, R: {scale_r:.3f} "
-          f"(scene: {scene_type}, warm-clamped: {scene_type == 'interior'})")
+          f"(scene: {scene_type}, strength: {strength})")
     return corrected
 
 
-# ─── Color Correction (neutral-zone exclusion) ──────────────────────
+# ─── Color Correction (preserving natural material tones) ────────────
 
 def apply_color_correction_pro(img, scene_type="interior"):
     """
-    Smart neutral push: only corrects pixels with existing color cast.
-    Pixels near neutral (low chroma) are LEFT ALONE — preserves gray floors.
+    Selective neutral push with higher neutral threshold (12.0).
+    Wood floors and warm cabinets have low-but-not-zero chroma —
+    they need to be PRESERVED, not pushed toward gray.
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
@@ -388,17 +391,17 @@ def apply_color_correction_pro(img, scene_type="interior"):
     # Measure how far each pixel is from neutral (128, 128)
     chroma = np.sqrt((a_float - 128) ** 2 + (b_float - 128) ** 2)
 
-    # Create mask: 0 for neutral pixels, 1 for saturated pixels
-    # Pixels with chroma < threshold are "neutral" and won't be touched
-    neutral_threshold = 8.0 if scene_type == "interior" else 6.0
+    # Higher threshold: wood/warm materials (chroma 5-12) are EXCLUDED
+    # Only pixels with strong cast (chroma > 12) get corrected
+    neutral_threshold = 12.0 if scene_type == "interior" else 8.0
     cast_mask = np.clip((chroma - neutral_threshold) / 10.0, 0, 1)
 
-    # Apply neutral push ONLY to pixels with existing cast
+    # Light neutral push only on strongly cast pixels
     neutral_strength = 0.03 if scene_type == "interior" else 0.05
     a_corrected = a_float + (128.0 - a_float) * neutral_strength * cast_mask
     b_corrected = b_float + (128.0 - b_float) * neutral_strength * cast_mask
 
-    # Vibrance boost (also masked — only boost already-colorful areas)
+    # Gentle vibrance
     max_chroma = np.percentile(chroma, 95) + 1e-6
     vibrance_mask = 1.0 - np.clip(chroma / max_chroma, 0, 1)
 
@@ -410,7 +413,7 @@ def apply_color_correction_pro(img, scene_type="interior"):
     b_out = np.clip(b_corrected, 0, 255).astype(np.uint8)
 
     neutral_pct = np.mean(cast_mask < 0.1) * 100
-    print(f"  [Color] Neutral push: {neutral_strength} | {neutral_pct:.0f}% pixels excluded (neutral zone)")
+    print(f"  [Color] Neutral push: {neutral_strength} | {neutral_pct:.0f}% pixels preserved (threshold: {neutral_threshold})")
 
     lab_out = cv2.merge([l, a_out, b_out])
     return cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
@@ -419,13 +422,13 @@ def apply_color_correction_pro(img, scene_type="interior"):
 # ─── Shadow/Highlight Recovery ───────────────────────────────────────
 
 def apply_shadow_highlight_recovery(img, scene_type="interior"):
-    """L-channel only shadow lifting — no color shift."""
+    """L-channel only — reduced strength to avoid washed-out look."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    shadow_threshold = 0.40 if scene_type == "interior" else 0.30
-    shadow_strength = 0.25 if scene_type == "interior" else 0.20
+    shadow_threshold = 0.35 if scene_type == "interior" else 0.30
+    shadow_strength = 0.18 if scene_type == "interior" else 0.15
 
     shadow_mask = np.clip((shadow_threshold - l_float) / shadow_threshold, 0, 1)
     shadow_lift = shadow_mask ** 2 * shadow_strength
@@ -433,7 +436,7 @@ def apply_shadow_highlight_recovery(img, scene_type="interior"):
 
     highlight_threshold = 0.92
     highlight_mask = np.clip((l_float - highlight_threshold) / (1.0 - highlight_threshold), 0, 1)
-    l_float = l_float - highlight_mask * 0.08
+    l_float = l_float - highlight_mask * 0.06
 
     l_out = np.clip(l_float * 255, 0, 255).astype(np.uint8)
     lab_out = cv2.merge([l_out, a, b])
@@ -534,7 +537,7 @@ def apply_perspective_correction(img):
 # ─── Main Pipeline ───────────────────────────────────────────────────
 
 def process_hdr(images, style="natural"):
-    print(f"[HDR Engine v5.1] Processing {len(images)} frames, style: {style}")
+    print(f"[HDR Engine v5.2] Processing {len(images)} frames, style: {style}")
     t0 = time.time()
 
     scene_type = detect_scene_type(images)
@@ -545,26 +548,26 @@ def process_hdr(images, style="natural"):
     print("[Step 2/9] Ghost removal...")
     deghosted = remove_ghosts(aligned)
 
-    print("[Step 3/9] Exposure fusion...")
+    # Capture floor reference from MIDDLE BRACKET (before fusion changes anything)
+    print("[Step 3/9] Capturing surface tone reference from source bracket...")
+    floor_ref = capture_surface_reference(images[len(images) // 2])
+
+    print("[Step 4/9] Exposure fusion...")
     merged = exposure_fusion(deghosted, scene_type)
 
-    # Capture floor reference BEFORE any color/tone processing
-    print("[Step 4/9] Capturing surface tone reference...")
-    floor_ref = capture_surface_reference(merged)
-
-    # Warm-clamped AWB
-    print("[Step 5/9] White balance (warm-clamped)...")
+    # Gentle warm-clamped AWB
+    print("[Step 5/9] White balance (gentle warm-clamp)...")
     merged = apply_auto_white_balance(merged, scene_type)
 
-    # LAB-only tone mapping
+    # LAB-only tone mapping — gentler
     print("[Step 6/9] LAB tone mapping...")
     merged = apply_lab_tone_mapping(merged, scene_type)
 
     print("[Step 7/9] Edge-aware contrast...")
     merged = apply_edge_aware_contrast(merged, scene_type)
 
-    # Neutral-zone color correction
-    print("[Step 8/9] Color correction (neutral-zone exclusion)...")
+    # Neutral-zone color correction — higher threshold preserves wood
+    print("[Step 8/9] Color correction (material-aware)...")
     merged = apply_color_correction_pro(merged, scene_type)
 
     print("[Step 9/9] Shadow/highlight recovery...")
@@ -576,8 +579,8 @@ def process_hdr(images, style="natural"):
     # Brightness auto-fix
     merged = apply_final_brightness_contrast(merged)
 
-    # Restore floor tones — final safety net
-    print("[Floor Restore] Checking for color drift...")
+    # Restore floor tones from SOURCE bracket reference
+    print("[Floor Restore] Checking for color drift vs source...")
     merged = restore_surface_tones(merged, floor_ref)
 
     # Perspective correction
@@ -587,7 +590,7 @@ def process_hdr(images, style="natural"):
     merged = apply_pro_sharpening(merged)
 
     elapsed = time.time() - t0
-    print(f"[HDR Engine v5.1] Done in {elapsed:.1f}s (scene: {scene_type})")
+    print(f"[HDR Engine v5.2] Done in {elapsed:.1f}s (scene: {scene_type})")
     return merged
 
 
@@ -601,7 +604,7 @@ def process_job(payload):
     webhook_secret = payload.get("webhookSecret") or payload.get("webhook_secret")
 
     print(f"\n{'='*60}")
-    print(f"[Job {job_id}] Starting HDR processing (v5.1)")
+    print(f"[Job {job_id}] Starting HDR processing (v5.2)")
     print(f"[Job {job_id}] Inputs: {len(input_urls)}, Style: {style}")
     print(f"[Job {job_id}] Webhook: {'yes' if webhook_url else 'no'}")
     print(f"{'='*60}")
@@ -692,5 +695,5 @@ if __name__ == "__main__":
     redis_conn = Redis.from_url(REDIS_URL)
     queue = Queue("hdr", connection=redis_conn)
     worker = Worker([queue], connection=redis_conn)
-    print("[Worker] Starting HDR worker v5.1 — warm-clamped AWB + neutral-zone color")
+    print("[Worker] Starting HDR worker v5.2 — balanced warmth + natural materials")
     worker.work(with_scheduler=False)
