@@ -17,7 +17,7 @@ def download_image(url: str) -> np.ndarray:
     arr = np.frombuffer(resp.content, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError(f"Failed to decode image from URL")
+        raise ValueError("Failed to decode image from URL")
     return img
 
 
@@ -46,131 +46,76 @@ def align_images(images: list[np.ndarray]) -> list[np.ndarray]:
                 _, warp_matrix = cv2.findTransformECC(
                     ref_gray, img_gray, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
                 )
-                img_aligned = cv2.warpAffine(
-                    img_resized, warp_matrix, (w, h),
-                    flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP,
-                    borderMode=cv2.BORDER_REFLECT
-                )
             except cv2.error:
                 # Fallback to ORB feature matching
-                logger.warning(f"ECC failed for image {i}, trying ORB feature matching")
-                img_aligned = align_with_features(ref_gray, img_gray, img_resized, w, h)
+                logger.warning(f"ECC failed for image {i}, trying ORB fallback")
+                orb = cv2.ORB_create(5000)
+                kp1, des1 = orb.detectAndCompute(ref_gray, None)
+                kp2, des2 = orb.detectAndCompute(img_gray, None)
+                if des1 is not None and des2 is not None:
+                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                    matches = bf.match(des1, des2)
+                    matches = sorted(matches, key=lambda x: x.distance)[:50]
+                    if len(matches) >= 4:
+                        src_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+                        dst_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+                        M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+                        if M is not None:
+                            warp_matrix = M.astype(np.float32)
 
-            aligned.append(img_aligned)
-            logger.info(f"Aligned image {i}/{len(images)-1}")
+            aligned_img = cv2.warpAffine(
+                img_resized, warp_matrix, (w, h),
+                flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REFLECT_101
+            )
+            aligned.append(aligned_img)
+            logger.info(f"Aligned image {i} successfully")
         except Exception as e:
-            logger.warning(f"Alignment failed for image {i}, using resized: {e}")
+            logger.warning(f"Alignment failed for image {i}: {e}, using resized version")
             aligned.append(cv2.resize(img, (w, h), interpolation=cv2.INTER_LANCZOS4))
 
     return aligned
 
 
-def align_with_features(ref_gray, img_gray, img_color, w, h):
-    """Feature-based alignment fallback using ORB."""
-    orb = cv2.ORB_create(5000)
-    kp1, des1 = orb.detectAndCompute(ref_gray, None)
-    kp2, des2 = orb.detectAndCompute(img_gray, None)
-
-    if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
-        return img_color
-
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    matches = bf.knnMatch(des1, des2, k=2)
-
-    # Lowe's ratio test
-    good = [m for m, n in matches if m.distance < 0.7 * n.distance]
-    if len(good) < 10:
-        return img_color
-
-    src_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-
-    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    if M is None:
-        return img_color
-
-    return cv2.warpPerspective(img_color, M, (w, h), flags=cv2.INTER_LANCZOS4,
-                                borderMode=cv2.BORDER_REFLECT)
-
-
-def create_luminosity_masks(img: np.ndarray) -> dict:
-    """Create luminosity masks for targeted adjustments."""
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    L = lab[:, :, 0].astype(np.float32) / 255.0
-
-    masks = {
-        "highlights": np.clip((L - 0.7) / 0.3, 0, 1),
-        "midtones": 1.0 - np.abs(L - 0.5) * 2.0,
-        "shadows": np.clip((0.3 - L) / 0.3, 0, 1),
-        "bright_windows": np.clip((L - 0.85) / 0.15, 0, 1),
-    }
-
-    # Smooth masks to avoid harsh transitions
-    for key in masks:
-        masks[key] = cv2.GaussianBlur(masks[key], (51, 51), 0)
-
-    return masks
-
-
-def window_pull(merged: np.ndarray, darks: list[np.ndarray]) -> np.ndarray:
-    """
-    Dedicated window pull: recover blown-out window areas using darker exposures.
-    This is the KEY differentiator for real estate HDR.
-    """
-    masks = create_luminosity_masks(merged)
-    window_mask = masks["bright_windows"]
-
-    if np.max(window_mask) < 0.05:
-        logger.info("No blown highlights detected, skipping window pull")
-        return merged
-
-    # Find the darkest exposure for window recovery
-    darkest = min(darks, key=lambda x: np.mean(cv2.cvtColor(x, cv2.COLOR_BGR2LAB)[:, :, 0]))
-
-    # Blend the darkest exposure into the blown areas
-    result = merged.astype(np.float32)
-    dark_f = darkest.astype(np.float32)
-
-    # Expand mask to 3 channels
-    mask_3ch = np.stack([window_mask] * 3, axis=-1)
-
-    # Weighted blend: use dark exposure in blown areas
-    blend_strength = 0.75  # How much of the dark exposure to use
-    result = result * (1 - mask_3ch * blend_strength) + dark_f * (mask_3ch * blend_strength)
-
-    logger.info(f"Window pull applied, max mask intensity: {np.max(window_mask):.2f}")
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def exposure_fusion_pro(images: list[np.ndarray]) -> np.ndarray:
-    """
-    Professional exposure fusion with optimized weights for real estate.
-    """
+def exposure_fusion(images: list[np.ndarray]) -> np.ndarray:
+    """Merge multiple exposures using Mertens fusion."""
     merge = cv2.createMergeMertens(
         contrast_weight=1.0,
-        saturation_weight=0.8,
+        saturation_weight=1.0,
         exposure_weight=1.0
     )
     fusion = merge.process(images)
-
-    # Mertens outputs float [0,1] but can exceed range
     fusion = np.clip(fusion * 255, 0, 255).astype(np.uint8)
     return fusion
 
 
-def enhance_local_contrast(img: np.ndarray, clip_limit: float = 2.5) -> np.ndarray:
-    """Apply CLAHE on luminance for local contrast without color shifts."""
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(16, 16))
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+def window_pull(images: list[np.ndarray], fused: np.ndarray) -> np.ndarray:
+    """Recover blown highlights (windows) by blending darker exposures."""
+    # Find the darkest exposure (best for window detail)
+    darkest = min(images, key=lambda img: np.mean(img))
+
+    # Create luminosity mask for bright areas
+    fused_gray = cv2.cvtColor(fused, cv2.COLOR_BGR2GRAY)
+    _, bright_mask = cv2.threshold(fused_gray, 220, 255, cv2.THRESH_BINARY)
+
+    # Feather the mask for smooth blending
+    bright_mask = cv2.GaussianBlur(bright_mask, (51, 51), 0)
+    mask_float = bright_mask.astype(np.float32) / 255.0
+    mask_3ch = np.stack([mask_float] * 3, axis=-1)
+
+    # Resize darkest to match fused
+    h, w = fused.shape[:2]
+    darkest_resized = cv2.resize(darkest, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+    # Blend: use darkest exposure in bright areas
+    result = (fused.astype(np.float32) * (1 - mask_3ch * 0.7) +
+              darkest_resized.astype(np.float32) * mask_3ch * 0.7)
+
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def color_correction(img: np.ndarray) -> np.ndarray:
-    """
-    Correct color casts - critical for neutral white walls in real estate.
-    Uses gray world assumption with safeguards.
-    """
+    """Gray-world color correction in LAB space."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     # Only correct if there's a noticeable cast
@@ -200,11 +145,10 @@ def smart_sharpen(img: np.ndarray, strength: float = 0.4) -> np.ndarray:
 def denoise_light(img: np.ndarray) -> np.ndarray:
     """Light denoising that preserves detail."""
     return cv2.fastNlMeansDenoisingColored(img, None, h=3, hForColorComponents=3,
-                                            templateWindowSize=7, searchWindowSize=21)
+                                           templateWindowSize=7, searchWindowSize=21)
 
 
-def process_job(job_id: str, image_urls: list[str], style: str = "natural",
-                webhook_url: str = None, webhook_secret: str = None):
+def process_job(data: dict):
     """
     Full HDR processing pipeline:
     1. Download & align images
@@ -215,6 +159,12 @@ def process_job(job_id: str, image_urls: list[str], style: str = "natural",
     6. Light denoise + smart sharpen
     7. High-quality JPEG output
     """
+    job_id = data.get("job_id", "")
+    image_urls = data.get("image_urls", [])
+    style = data.get("style", "natural")
+    webhook_url = data.get("webhook_url")
+    webhook_secret = data.get("webhook_secret")
+
     logger.info(f"[{job_id}] Starting HDR processing, {len(image_urls)} images, style={style}")
 
     try:
@@ -228,71 +178,75 @@ def process_job(job_id: str, image_urls: list[str], style: str = "natural",
         if len(images) < 2:
             raise ValueError("Need at least 2 images for HDR merge")
 
-        # 2. Align images
-        logger.info(f"[{job_id}] Aligning {len(images)} images...")
+        # 2. Align
+        logger.info(f"[{job_id}] Aligning images...")
         aligned = align_images(images)
 
         # 3. Exposure fusion
         logger.info(f"[{job_id}] Running exposure fusion...")
-        merged = exposure_fusion_pro(aligned)
+        fused = exposure_fusion(aligned)
 
-        # 4. Window pull - recover blown-out windows using dark exposures
+        # 4. Window pull
         logger.info(f"[{job_id}] Applying window pull...")
-        merged = window_pull(merged, aligned)
+        pulled = window_pull(aligned, fused)
 
         # 5. Color correction
-        logger.info(f"[{job_id}] Correcting colors...")
-        merged = color_correction(merged)
+        logger.info(f"[{job_id}] Color correction...")
+        corrected = color_correction(pulled)
 
-        # 6. Local contrast enhancement
-        clip = 3.0 if style == "detailed" else 2.0
-        logger.info(f"[{job_id}] Enhancing local contrast (clip={clip})...")
-        merged = enhance_local_contrast(merged, clip_limit=clip)
+        # 6. CLAHE local contrast
+        logger.info(f"[{job_id}] Applying CLAHE...")
+        lab = cv2.cvtColor(corrected, cv2.COLOR_BGR2LAB)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-        # 7. Light denoise
-        logger.info(f"[{job_id}] Applying light denoise...")
-        merged = denoise_light(merged)
+        # 7. Denoise + sharpen
+        logger.info(f"[{job_id}] Denoising and sharpening...")
+        denoised = denoise_light(enhanced)
+        final = smart_sharpen(denoised, strength=0.4)
 
-        # 8. Smart sharpen
-        logger.info(f"[{job_id}] Sharpening...")
-        merged = smart_sharpen(merged, strength=0.35)
+        # Encode as high-quality JPEG
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+        _, buffer = cv2.imencode('.jpg', final, encode_params)
+        result_b64 = base64.b64encode(buffer).decode('utf-8')
 
-        # 9. Encode as high-quality JPEG
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 98]
-        success, buffer = cv2.imencode(".jpg", merged, encode_params)
-        if not success:
-            raise RuntimeError("Failed to encode output image")
+        logger.info(f"[{job_id}] HDR processing complete, output size: {len(result_b64)} chars")
 
-        result_b64 = base64.b64encode(buffer).decode("utf-8")
-        data_url = f"data:image/jpeg;base64,{result_b64}"
-        size_kb = len(buffer) / 1024
-        logger.info(f"[{job_id}] Output: {merged.shape}, {size_kb:.0f} KB")
-
-        # Save locally for direct download
+        # Also save to outputs/ for direct download
         os.makedirs("outputs", exist_ok=True)
-        output_path = f"outputs/{job_id}.jpg"
+        output_path = os.path.join("outputs", f"{job_id}.jpg")
         with open(output_path, "wb") as f:
             f.write(buffer)
+        logger.info(f"[{job_id}] Saved to {output_path}")
 
-        # Send result via webhook
+        # Send webhook
         if webhook_url:
-            logger.info(f"[{job_id}] Sending result to webhook...")
+            logger.info(f"[{job_id}] Sending webhook to {webhook_url}")
             headers = {"Content-Type": "application/json"}
             if webhook_secret:
                 headers["x-webhook-secret"] = webhook_secret
+            
             payload = {
                 "jobId": job_id,
                 "status": "completed",
-                "outputUrl": data_url,
+                "result": result_b64
             }
-            resp = requests.post(webhook_url, json=payload, headers=headers, timeout=120)
-            logger.info(f"[{job_id}] Webhook response: {resp.status_code}")
+            
+            try:
+                resp = requests.post(webhook_url, json=payload, headers=headers, timeout=120)
+                logger.info(f"[{job_id}] Webhook response: {resp.status_code}")
+                if resp.status_code != 200:
+                    logger.error(f"[{job_id}] Webhook body: {resp.text[:500]}")
+            except Exception as e:
+                logger.error(f"[{job_id}] Webhook failed: {e}")
 
-        return {"status": "completed", "output_path": output_path}
+        return {"status": "completed", "job_id": job_id}
 
     except Exception as e:
-        logger.error(f"[{job_id}] Processing failed: {e}", exc_info=True)
+        logger.error(f"[{job_id}] Processing failed: {e}")
 
+        # Send failure webhook
         if webhook_url:
             try:
                 headers = {"Content-Type": "application/json"}
@@ -301,7 +255,7 @@ def process_job(job_id: str, image_urls: list[str], style: str = "natural",
                 requests.post(webhook_url, json={
                     "jobId": job_id,
                     "status": "failed",
-                    "error": str(e),
+                    "error": str(e)
                 }, headers=headers, timeout=30)
             except Exception:
                 pass
