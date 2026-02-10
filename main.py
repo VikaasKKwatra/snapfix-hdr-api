@@ -9,7 +9,7 @@ import redis
 app = FastAPI()
 
 REDIS_URL = os.getenv("REDIS_URL") or os.getenv("REDIS_PRIVATE_URL") or os.getenv("REDIS_PUBLIC_URL") or ""
-QUEUE_NAME = os.getenv("RQ_QUEUE", "default")
+QUEUE_NAME = os.getenv("QUEUE_NAME", "hdr")
 API_KEY = os.getenv("SNAPFIX_API_KEY", "")
 
 
