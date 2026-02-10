@@ -187,8 +187,8 @@ def exposure_fusion(images, scene_type="interior"):
 
 # ─── Tone Mapping ────────────────────────────────────────────────────
 
-def apply_s_curve(img, strength=0.45):
-    """S-curve sigmoid contrast for cinematic look."""
+def apply_s_curve(img, strength=0.50):
+    """S-curve sigmoid contrast — refined for balanced punch without crushing."""
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         x = i / 255.0
@@ -201,8 +201,8 @@ def apply_s_curve(img, strength=0.45):
     return result
 
 
-def apply_gamma(img, gamma=0.93):
-    """Gamma correction for brightness punch."""
+def apply_gamma(img, gamma=0.91):
+    """Gamma correction for brightness punch — refined to avoid dull whites."""
     inv_gamma = 1.0 / gamma
     table = np.array([(i / 255.0) ** inv_gamma * 255
                       for i in range(256)]).astype(np.uint8)
@@ -306,7 +306,7 @@ def apply_auto_white_balance(img, scene_type="interior"):
     scale_g = np.clip(scale_g, min_correction, max_correction)
     scale_r = np.clip(scale_r, min_correction, max_correction)
 
-    # FIX 3: Reduced strength to prevent warm shift on cool-toned floors
+    # Reduced AWB strength to prevent warm shift on cool-toned floors
     strength = 0.35 if scene_type == "interior" else 0.25
 
     scale_b = 1.0 + (scale_b - 1.0) * strength
@@ -334,7 +334,7 @@ def apply_color_correction_pro(img, scene_type="interior"):
     a_float = a.astype(np.float32)
     b_float = b.astype(np.float32)
 
-    # FIX 5: Reduced neutral push to preserve cool gray tones
+    # Reduced neutral push to preserve cool gray tones on floors
     neutral_strength = 0.10 if scene_type == "interior" else 0.08
 
     a_corrected = a_float + (128.0 - a_float) * neutral_strength
@@ -363,7 +363,7 @@ def apply_shadow_highlight_recovery(img, scene_type="interior"):
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    # FIX 4: Stronger shadow recovery for dark areas like stairways
+    # Stronger shadow recovery for dark areas like stairways
     shadow_threshold = 0.45 if scene_type == "interior" else 0.30
     shadow_strength = 0.35 if scene_type == "interior" else 0.20
 
@@ -503,10 +503,10 @@ def process_hdr(images, style="natural"):
     print("[Step 4/9] Auto white balance...")
     merged = apply_auto_white_balance(merged, scene_type)
 
-    # 6. Tone mapping — FIX 1 & 2: softer S-curve and gamma
+    # 6. Tone mapping — balanced: bright whites + preserved floor tones
     print("[Step 5/9] Tone mapping (S-curve + gamma)...")
-    merged = apply_s_curve(merged, strength=0.45 if scene_type == "exterior" else 0.45)
-    merged = apply_gamma(merged, gamma=0.95 if scene_type == "exterior" else 0.93)
+    merged = apply_s_curve(merged, strength=0.50 if scene_type == "exterior" else 0.50)
+    merged = apply_gamma(merged, gamma=0.93 if scene_type == "exterior" else 0.91)
 
     # 7. Edge-aware contrast
     print("[Step 6/9] Edge-aware contrast enhancement...")
