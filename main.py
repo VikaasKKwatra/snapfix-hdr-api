@@ -1,87 +1,114 @@
 import os
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import List, Optional
+import uuid
+import logging
+from typing import Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from redis import Redis
 from rq import Queue
-import redis
 
-app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL") or os.getenv("REDIS_PRIVATE_URL") or os.getenv("REDIS_PUBLIC_URL") or ""
-QUEUE_NAME = os.getenv("QUEUE_NAME", "hdr")
-API_KEY = os.getenv("SNAPFIX_API_KEY", "")
+app = FastAPI(title="HDR Merge Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Redis / RQ setup
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_conn = Redis.from_url(REDIS_URL)
+task_queue = Queue("hdr_jobs", connection=redis_conn)
 
 
-class JobRequest(BaseModel):
-    jobId: Optional[str] = None
-    job_id: Optional[str] = None
-    inputUrls: Optional[List[str]] = None
-    input_urls: Optional[List[str]] = None
-    style: str = "natural"
-    resolution: str = "standard"
-    webhookUrl: Optional[str] = None
-    webhook_url: Optional[str] = None
-    webhookSecret: Optional[str] = None
-    webhook_secret: Optional[str] = None
-    callbackUrl: Optional[str] = None
+class HDRJobRequest(BaseModel):
+    job_id: Optional[str] = Field(None, alias="jobId")
+    input_urls: list[str] = Field(..., alias="inputUrls")
+    webhook_url: Optional[str] = Field(None, alias="webhookUrl")
+    webhook_secret: Optional[str] = Field(None, alias="webhookSecret")
+    weights: Optional[list[float]] = Field(None, alias="weights")
 
-    @property
-    def canonical_job_id(self) -> str:
-        return self.jobId or self.job_id or ""
+    class Config:
+        populate_by_name = True
 
-    @property
-    def canonical_input_urls(self) -> List[str]:
-        return self.inputUrls or self.input_urls or []
 
-    @property
-    def canonical_webhook_url(self) -> Optional[str]:
-        return self.webhookUrl or self.webhook_url or self.callbackUrl
-
-    @property
-    def canonical_webhook_secret(self) -> Optional[str]:
-        return self.webhookSecret or self.webhook_secret
+class HDRJobResponse(BaseModel):
+    job_id: str = Field(..., alias="jobId")
+    status: str
 
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+async def health():
+    return {"status": "ok", "queue_size": len(task_queue)}
 
 
-@app.post("/v1/hdr/jobs")
-def create_job(req: JobRequest, x_api_key: str = Query("")):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+@app.post("/merge", response_model=HDRJobResponse)
+async def create_merge_job(request: HDRJobRequest):
+    job_id = request.job_id or str(uuid.uuid4())
 
-    if not REDIS_URL:
-        raise HTTPException(status_code=500, detail="REDIS_URL missing on server.")
+    logger.info(f"[API] New merge job {job_id} with {len(request.input_urls)} images")
 
-    jid = req.canonical_job_id
-    urls = req.canonical_input_urls
-    if not jid or len(urls) < 2:
-        raise HTTPException(status_code=400, detail="Need jobId and at least 2 inputUrls")
+    if len(request.input_urls) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 input images")
 
-    job_data = {
-        "jobId": jid,
-        "inputUrls": urls,
-        "style": req.style,
-        "webhookUrl": req.canonical_webhook_url,
-        "webhookSecret": req.canonical_webhook_secret,
+    if len(request.input_urls) > 9:
+        raise HTTPException(status_code=400, detail="Maximum 9 input images")
+
+    # Single dict payload for reliable RQ serialization
+    payload = {
+        "job_id": job_id,
+        "input_urls": request.input_urls,
+        "webhook_url": request.webhook_url,
+        "webhook_secret": request.webhook_secret,
+        "weights": request.weights,
     }
 
-    r = redis.from_url(REDIS_URL)
-    q = Queue(QUEUE_NAME, connection=r)
+    task_queue.enqueue(
+        "app.worker.process_job",
+        payload,
+        job_id=job_id,
+        job_timeout="600s",
+        result_ttl=3600,
+    )
 
-    from worker import process_job
-    q.enqueue(process_job, job_data, job_id=jid)
-
-    return {"accepted": True, "jobId": jid, "status": "QUEUED"}
+    logger.info(f"[API] Job {job_id} enqueued successfully")
+    return HDRJobResponse(jobId=job_id, status="queued")
 
 
-@app.get("/v1/hdr/result/{job_id}")
-def get_result(job_id: str):
-    out_dir = os.getenv("OUTPUT_DIR", "outputs")
-    path = os.path.join(out_dir, f"{job_id}.jpg")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Not ready")
-    return FileResponse(path, media_type="image/jpeg", filename=f"{job_id}.jpg")
+@app.get("/status/{job_id}")
+async def get_job_status(job_id: str):
+    from rq.job import Job as RQJob
+    try:
+        rq_job = RQJob.fetch(job_id, connection=redis_conn)
+        status_map = {
+            "queued": "queued",
+            "started": "processing",
+            "finished": "completed",
+            "failed": "failed",
+            "deferred": "queued",
+            "scheduled": "queued",
+        }
+        status = status_map.get(rq_job.get_status(), "unknown")
+
+        result = None
+        error = None
+        if status == "completed" and rq_job.result:
+            result = rq_job.result
+        if status == "failed":
+            error = str(rq_job.exc_info) if rq_job.exc_info else "Unknown error"
+
+        return {
+            "jobId": job_id,
+            "status": status,
+            "result": result,
+            "error": error,
+        }
+    except Exception as e:
+        logger.error(f"[API] Status check failed for {job_id}: {e}")
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
