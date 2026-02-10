@@ -1,6 +1,7 @@
 """
 Snapfix HDR Worker – Professional Real Estate HDR Processing Engine
 Processes bracketed exposures into publication-ready HDR images.
+v4 – Floor tone preservation fix
 """
 
 import io
@@ -187,8 +188,8 @@ def exposure_fusion(images, scene_type="interior"):
 
 # ─── Tone Mapping ────────────────────────────────────────────────────
 
-def apply_s_curve(img, strength=0.50):
-    """S-curve sigmoid contrast — refined for balanced punch without crushing."""
+def apply_s_curve(img, strength=0.40):
+    """S-curve sigmoid contrast — dialed back to prevent saturation boost on warm tones."""
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         x = i / 255.0
@@ -201,12 +202,87 @@ def apply_s_curve(img, strength=0.50):
     return result
 
 
-def apply_gamma(img, gamma=0.91):
-    """Gamma correction for brightness punch — refined to avoid dull whites."""
+def apply_gamma(img, gamma=0.94):
+    """Gamma correction — gentler to avoid warming neutral tones."""
     inv_gamma = 1.0 / gamma
     table = np.array([(i / 255.0) ** inv_gamma * 255
                       for i in range(256)]).astype(np.uint8)
     return cv2.LUT(img, table)
+
+
+# ─── Floor/Surface Tone Preservation ────────────────────────────────
+
+def capture_surface_reference(img):
+    """
+    Capture the hue/saturation signature of large neutral surfaces (floors, walls)
+    from the ORIGINAL fused image before any color processing.
+    Returns a reference dict with LAB stats for the bottom half (floor area).
+    """
+    h, w = img.shape[:2]
+    # Bottom 40% is typically floor
+    floor_region = img[int(h * 0.6):, :]
+    lab = cv2.cvtColor(floor_region, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    ref = {
+        "a_mean": np.mean(a.astype(np.float32)),
+        "b_mean": np.mean(b.astype(np.float32)),
+        "a_std": np.std(a.astype(np.float32)),
+        "b_std": np.std(b.astype(np.float32)),
+    }
+    print(f"  [FloorRef] Captured — a_mean: {ref['a_mean']:.1f}, b_mean: {ref['b_mean']:.1f}")
+    return ref
+
+
+def restore_surface_tones(img, reference):
+    """
+    After all processing, compare the floor region's color to the original reference
+    and correct any drift. This is the final safety net against color shifts.
+    """
+    h, w = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    # Measure current floor
+    floor_a = a[int(h * 0.6):, :].astype(np.float32)
+    floor_b = b[int(h * 0.6):, :].astype(np.float32)
+    curr_a_mean = np.mean(floor_a)
+    curr_b_mean = np.mean(floor_b)
+
+    # Calculate drift
+    a_drift = curr_a_mean - reference["a_mean"]
+    b_drift = curr_b_mean - reference["b_mean"]
+
+    print(f"  [FloorRestore] Drift — a: {a_drift:+.1f}, b: {b_drift:+.1f}")
+
+    # Only correct if drift is significant (> 1.5 LAB units)
+    if abs(a_drift) < 1.5 and abs(b_drift) < 1.5:
+        print(f"  [FloorRestore] Drift within tolerance — no correction needed")
+        return img
+
+    # Apply graduated correction: full strength at bottom, fading to zero at middle
+    a_float = a.astype(np.float32)
+    b_float = b.astype(np.float32)
+
+    # Create vertical gradient mask: 0 at top, 1 at bottom
+    gradient = np.zeros((h, w), dtype=np.float32)
+    fade_start = int(h * 0.35)  # Start fading from 35%
+    for y in range(fade_start, h):
+        gradient[y, :] = (y - fade_start) / (h - fade_start)
+
+    # Correct 80% of the drift (keep some natural variation)
+    correction_strength = 0.80
+    a_float -= a_drift * correction_strength * gradient
+    b_float -= b_drift * correction_strength * gradient
+
+    a_out = np.clip(a_float, 0, 255).astype(np.uint8)
+    b_out = np.clip(b_float, 0, 255).astype(np.uint8)
+
+    lab_out = cv2.merge([l, a_out, b_out])
+    result = cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
+    print(f"  [FloorRestore] Corrected a by {-a_drift * correction_strength:+.1f}, "
+          f"b by {-b_drift * correction_strength:+.1f}")
+    return result
 
 
 # ─── Edge-Aware Contrast (replaces global CLAHE) ────────────────────
@@ -221,7 +297,6 @@ def apply_edge_aware_contrast(img, scene_type="interior"):
     l_float = l_channel.astype(np.float32) / 255.0
 
     radius = 16 if scene_type == "interior" else 20
-    eps = 0.01 if scene_type == "interior" else 0.02
 
     base = cv2.bilateralFilter(l_float, d=radius, sigmaColor=0.1, sigmaSpace=radius)
     detail = l_float - base
@@ -286,8 +361,7 @@ def apply_adaptive_denoising(img):
 
 def apply_auto_white_balance(img, scene_type="interior"):
     """
-    Correct color casts common in real estate interiors (yellow/orange from tungsten)
-    and exteriors (blue cast from shade). Uses gray-world with intelligent clamping.
+    Minimal WB correction — only fix obvious casts, don't touch neutral scenes.
     """
     img_float = img.astype(np.float32)
     b, g, r = cv2.split(img_float)
@@ -299,15 +373,15 @@ def apply_auto_white_balance(img, scene_type="interior"):
     scale_g = avg_all / (avg_g + 1e-6)
     scale_r = avg_all / (avg_r + 1e-6)
 
-    max_correction = 1.25 if scene_type == "interior" else 1.15
+    max_correction = 1.15 if scene_type == "interior" else 1.15
     min_correction = 1.0 / max_correction
 
     scale_b = np.clip(scale_b, min_correction, max_correction)
     scale_g = np.clip(scale_g, min_correction, max_correction)
     scale_r = np.clip(scale_r, min_correction, max_correction)
 
-    # Reduced AWB strength to prevent warm shift on cool-toned floors
-    strength = 0.35 if scene_type == "interior" else 0.25
+    # Very low AWB strength — preserve what's already neutral
+    strength = 0.15 if scene_type == "interior" else 0.20
 
     scale_b = 1.0 + (scale_b - 1.0) * strength
     scale_g = 1.0 + (scale_g - 1.0) * strength
@@ -320,22 +394,22 @@ def apply_auto_white_balance(img, scene_type="interior"):
     ]).astype(np.uint8)
 
     print(f"  [WB] Corrections — B: {scale_b:.3f}, G: {scale_g:.3f}, R: {scale_r:.3f} "
-          f"(scene: {scene_type})")
+          f"(scene: {scene_type}, strength: {strength})")
     return corrected
 
 
 # ─── Color Correction ───────────────────────────────────────────────
 
 def apply_color_correction_pro(img, scene_type="interior"):
-    """Neutral push + vibrance boost in LAB space."""
+    """Minimal neutral push + vibrance boost in LAB space."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
     a_float = a.astype(np.float32)
     b_float = b.astype(np.float32)
 
-    # Reduced neutral push to preserve cool gray tones on floors
-    neutral_strength = 0.10 if scene_type == "interior" else 0.08
+    # Almost zero neutral push — stop warming cool gray floors
+    neutral_strength = 0.04 if scene_type == "interior" else 0.06
 
     a_corrected = a_float + (128.0 - a_float) * neutral_strength
     b_corrected = b_float + (128.0 - b_float) * neutral_strength
@@ -344,7 +418,7 @@ def apply_color_correction_pro(img, scene_type="interior"):
     max_chroma = np.percentile(chroma, 95) + 1e-6
     vibrance_mask = 1.0 - np.clip(chroma / max_chroma, 0, 1)
 
-    vibrance_amount = 0.15 if scene_type == "interior" else 0.20
+    vibrance_amount = 0.10 if scene_type == "interior" else 0.15
     a_corrected = a_corrected + (a_corrected - 128) * vibrance_mask * vibrance_amount
     b_corrected = b_corrected + (b_corrected - 128) * vibrance_mask * vibrance_amount
 
@@ -363,9 +437,8 @@ def apply_shadow_highlight_recovery(img, scene_type="interior"):
     l, a, b = cv2.split(lab)
     l_float = l.astype(np.float32) / 255.0
 
-    # Stronger shadow recovery for dark areas like stairways
-    shadow_threshold = 0.45 if scene_type == "interior" else 0.30
-    shadow_strength = 0.35 if scene_type == "interior" else 0.20
+    shadow_threshold = 0.40 if scene_type == "interior" else 0.30
+    shadow_strength = 0.25 if scene_type == "interior" else 0.20
 
     shadow_mask = np.clip((shadow_threshold - l_float) / shadow_threshold, 0, 1)
     shadow_lift = shadow_mask ** 2 * shadow_strength
@@ -480,7 +553,7 @@ def apply_perspective_correction(img):
 # ─── Main Processing Pipeline ────────────────────────────────────────
 
 def process_hdr(images, style="natural"):
-    """Full HDR processing pipeline with scene-aware processing."""
+    """Full HDR processing pipeline with floor tone preservation."""
     print(f"[HDR Engine] Processing {len(images)} frames, style: {style}")
     t0 = time.time()
 
@@ -488,44 +561,52 @@ def process_hdr(images, style="natural"):
     scene_type = detect_scene_type(images)
 
     # 2. Align
-    print("[Step 1/9] Aligning frames...")
+    print("[Step 1/10] Aligning frames...")
     aligned = align_images_ecc(images)
 
     # 3. Ghost removal
-    print("[Step 2/9] Ghost removal...")
+    print("[Step 2/10] Ghost removal...")
     deghosted = remove_ghosts(aligned)
 
     # 4. Exposure fusion
-    print("[Step 3/9] Exposure fusion...")
+    print("[Step 3/10] Exposure fusion...")
     merged = exposure_fusion(deghosted, scene_type)
 
-    # 5. Auto white balance
-    print("[Step 4/9] Auto white balance...")
+    # *** CAPTURE floor reference BEFORE any color processing ***
+    print("[Step 4/10] Capturing surface tone reference...")
+    floor_ref = capture_surface_reference(merged)
+
+    # 5. Auto white balance (minimal)
+    print("[Step 5/10] Auto white balance...")
     merged = apply_auto_white_balance(merged, scene_type)
 
-    # 6. Tone mapping — balanced: bright whites + preserved floor tones
-    print("[Step 5/9] Tone mapping (S-curve + gamma)...")
-    merged = apply_s_curve(merged, strength=0.50 if scene_type == "exterior" else 0.50)
-    merged = apply_gamma(merged, gamma=0.93 if scene_type == "exterior" else 0.91)
+    # 6. Tone mapping — gentle to preserve neutrals
+    print("[Step 6/10] Tone mapping (S-curve + gamma)...")
+    merged = apply_s_curve(merged, strength=0.45 if scene_type == "exterior" else 0.40)
+    merged = apply_gamma(merged, gamma=0.93 if scene_type == "exterior" else 0.94)
 
     # 7. Edge-aware contrast
-    print("[Step 6/9] Edge-aware contrast enhancement...")
+    print("[Step 7/10] Edge-aware contrast enhancement...")
     merged = apply_edge_aware_contrast(merged, scene_type)
 
-    # 8. Color correction
-    print("[Step 7/9] Color correction + vibrance...")
+    # 8. Color correction (minimal neutral push)
+    print("[Step 8/10] Color correction + vibrance...")
     merged = apply_color_correction_pro(merged, scene_type)
 
     # 9. Shadow/highlight recovery
-    print("[Step 8/9] Shadow/highlight recovery...")
+    print("[Step 9/10] Shadow/highlight recovery...")
     merged = apply_shadow_highlight_recovery(merged, scene_type)
 
     # 10. Adaptive denoising
-    print("[Step 9/9] Adaptive denoising...")
+    print("[Step 10/10] Adaptive denoising...")
     merged = apply_adaptive_denoising(merged)
 
     # 11. Brightness auto-fix
     merged = apply_final_brightness_contrast(merged)
+
+    # *** RESTORE floor tones — final safety net ***
+    print("[Floor Restore] Checking for color drift...")
+    merged = restore_surface_tones(merged, floor_ref)
 
     # 12. Perspective correction
     merged = apply_perspective_correction(merged)
@@ -640,5 +721,5 @@ if __name__ == "__main__":
     redis_conn = Redis.from_url(REDIS_URL)
     queue = Queue("hdr", connection=redis_conn)
     worker = Worker([queue], connection=redis_conn)
-    print("[Worker] Starting HDR worker...")
+    print("[Worker] Starting HDR worker v4 — floor tone preservation")
     worker.work(with_scheduler=False)
