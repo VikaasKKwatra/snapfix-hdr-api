@@ -1,12 +1,14 @@
-import redis
-from rq import Worker, Queue, Connection
-
+"""Entry point for the Railway worker service."""
 import os
+from redis import Redis
+from rq import Worker, Queue
 
-redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-conn = redis.from_url(redis_url)
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 if __name__ == "__main__":
-    with Connection(conn):
-        worker = Worker(["hdr"])
-        worker.work()
+    redis_conn = Redis.from_url(REDIS_URL)
+    queue = Queue("hdr_jobs", connection=redis_conn)
+    worker = Worker([queue], connection=redis_conn)
+    print(f"[Worker] Starting RQ worker, listening on queue 'hdr_jobs'")
+    print(f"[Worker] Redis: {REDIS_URL[:30]}...")
+    worker.work(with_scheduler=False)
