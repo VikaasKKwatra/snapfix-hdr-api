@@ -10,8 +10,10 @@ import traceback
 import numpy as np
 from PIL import Image
 
+
 FINAL_JPEG_QUALITY = 97
-WEBHOOK_JPEG_QUALITY = 85
+WEBHOOK_JPEG_QUALITY = 92
+
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 redis_conn = redis.from_url(REDIS_URL)
@@ -69,28 +71,86 @@ def remove_vignette(img: np.ndarray) -> np.ndarray:
 
 
 def correct_perspective(img: np.ndarray, scene: str) -> np.ndarray:
-    if scene != "interior":
-        return img
+    """Straighten vertical lines using Hough transform + keystone correction."""
+    h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
-    if lines is None or len(lines) < 5:
+    edges = cv2.Canny(gray, 40, 120, apertureSize=3)
+
+    # Detect lines
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                            minLineLength=min(h, w) // 6, maxLineGap=12)
+    if lines is None or len(lines) < 4:
         return img
-    angles = []
+
+    # Collect near-vertical line angles (within 20° of vertical)
+    vert_angles = []
+    vert_lines = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
-        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        if abs(angle) < 15 or abs(abs(angle) - 90) < 15:
-            angles.append(angle)
-    if not angles:
-        return img
-    near_zero = [a for a in angles if abs(a) < 15]
-    if near_zero:
-        median_angle = float(np.median(near_zero))
-        if abs(median_angle) > 0.3 and abs(median_angle) < 5.0:
-            h, w = img.shape[:2]
+        length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        if length < min(h, w) // 8:
+            continue
+        angle = np.degrees(np.arctan2(x2 - x1, y2 - y1))  # angle from vertical
+        if abs(angle) < 20:
+            vert_angles.append(angle)
+            vert_lines.append((x1, y1, x2, y2, length))
+
+    # --- Step A: Rotation correction (straighten tilt) ---
+    if vert_angles:
+        # Weight by line length for more accurate median
+        weights = np.array([l[4] for l in vert_lines])
+        angles_arr = np.array(vert_angles)
+        sorted_idx = np.argsort(angles_arr)
+        cum_weights = np.cumsum(weights[sorted_idx])
+        median_idx = np.searchsorted(cum_weights, cum_weights[-1] / 2.0)
+        median_angle = float(angles_arr[sorted_idx[median_idx]])
+
+        # Apply rotation if tilt is between 0.15° and 8°
+        if 0.15 < abs(median_angle) < 8.0:
+            print(f"[Worker] Perspective: rotating {median_angle:.2f}°")
             M = cv2.getRotationMatrix2D((w / 2, h / 2), median_angle, 1.0)
-            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
+            img = cv2.warpAffine(img, M, (w, h),
+                                 flags=cv2.INTER_LANCZOS4,
+                                 borderMode=cv2.BORDER_REFLECT)
+
+    # --- Step B: Keystone correction (converging verticals) ---
+    if len(vert_lines) >= 6:
+        left_lines = [(x1, y1, x2, y2) for x1, y1, x2, y2, l in vert_lines if (x1 + x2) / 2 < w * 0.4]
+        right_lines = [(x1, y1, x2, y2) for x1, y1, x2, y2, l in vert_lines if (x1 + x2) / 2 > w * 0.6]
+
+        if len(left_lines) >= 2 and len(right_lines) >= 2:
+            def avg_tilt(lines_subset):
+                tilts = [np.degrees(np.arctan2(x2 - x1, y2 - y1)) for x1, y1, x2, y2 in lines_subset]
+                return float(np.median(tilts))
+
+            left_tilt = avg_tilt(left_lines)
+            right_tilt = avg_tilt(right_lines)
+            convergence = left_tilt - right_tilt  # positive = converging at top
+
+            if abs(convergence) > 0.3 and abs(convergence) < 12.0:
+                # Apply perspective warp to correct keystone
+                shift = convergence * w / 800.0  # proportional shift
+                shift = np.clip(shift, -w * 0.03, w * 0.03)
+
+                src_pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+                dst_pts = np.float32([
+                    [shift, 0],
+                    [w - shift, 0],
+                    [w, h],
+                    [0, h]
+                ]) if convergence > 0 else np.float32([
+                    [0, 0],
+                    [w, 0],
+                    [w + shift, h],
+                    [-shift, h]
+                ])
+
+                M_persp = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                img = cv2.warpPerspective(img, M_persp, (w, h),
+                                          flags=cv2.INTER_LANCZOS4,
+                                          borderMode=cv2.BORDER_REFLECT)
+                print(f"[Worker] Perspective: keystone correction {convergence:.2f}° (shift={shift:.1f}px)")
+
     return img
 
 
@@ -202,7 +262,6 @@ def preserve_surface_tones(original: np.ndarray, processed: np.ndarray) -> np.nd
     lab_orig = cv2.cvtColor(original, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_proc = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB).astype(np.float32)
     L_orig = lab_orig[:, :, 0]
-    neutral_mask = np.ones_like(L_orig)
     a_orig = lab_orig[:, :, 1]
     b_orig = lab_orig[:, :, 2]
     chroma = np.sqrt((a_orig - 128)**2 + (b_orig - 128)**2)
@@ -240,13 +299,23 @@ def adaptive_denoise(img: np.ndarray) -> np.ndarray:
 
 
 def sharpen(img: np.ndarray) -> np.ndarray:
+    """Multi-scale unsharp mask with stronger weights for architectural detail."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
+
+    # Fine detail pass (sigma=1.0) — stronger
     blur1 = cv2.GaussianBlur(L, (0, 0), sigmaX=1.0)
-    sharp_fine = cv2.addWeighted(L, 1.3, blur1, -0.3, 0)
+    sharp_fine = cv2.addWeighted(L, 1.5, blur1, -0.5, 0)
+
+    # Mid-frequency pass (sigma=2.0) — stronger
     blur2 = cv2.GaussianBlur(sharp_fine, (0, 0), sigmaX=2.0)
-    sharp_mid = cv2.addWeighted(sharp_fine, 1.15, blur2, -0.15, 0)
-    return cv2.cvtColor(cv2.merge([sharp_mid, A, B]), cv2.COLOR_LAB2BGR)
+    sharp_mid = cv2.addWeighted(sharp_fine, 1.25, blur2, -0.25, 0)
+
+    # Coarse structure pass (sigma=4.0) — new, for edge crispness
+    blur3 = cv2.GaussianBlur(sharp_mid, (0, 0), sigmaX=4.0)
+    sharp_coarse = cv2.addWeighted(sharp_mid, 1.1, blur3, -0.1, 0)
+
+    return cv2.cvtColor(cv2.merge([sharp_coarse, A, B]), cv2.COLOR_LAB2BGR)
 
 
 def encode_jpeg(img: np.ndarray, quality: int) -> bytes:
