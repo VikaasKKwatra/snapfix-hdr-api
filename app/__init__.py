@@ -1,1 +1,1 @@
-# Snapfix HDR API
+# SnapFix HDR Processing Engine
