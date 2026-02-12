@@ -1,689 +1,558 @@
 """
-Snapfix HDR Worker – Professional Real Estate HDR Processing Engine
-v5.2 – Balanced warmth preservation + natural wood tones + webhook compression
+Snapfix HDR Worker v5.2
+Professional real estate HDR merge with OpenCV.
 """
 
-import io
 import os
-import time
+import io
+import cv2
 import json
-import traceback
+import base64
+import logging
+import tempfile
 import requests
 import numpy as np
-import cv2
 from redis import Redis
-from rq import Worker, Queue
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hdr-worker")
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-JPEG_QUALITY = 97
+redis_conn = Redis.from_url(REDIS_URL)
+
+RESULTS_PREFIX = "hdr_result:"
+STATUS_PREFIX = "hdr_status:"
+
+# ========== QUALITY SETTINGS ==========
+FINAL_JPEG_QUALITY = 97       # Final output quality (professional grade)
+WEBHOOK_JPEG_QUALITY = 85     # Transfer quality (bypass Railway 120s timeout)
+# ======================================
 
 
-# ─── Scene Detection ────────────────────────────────────────────────
+def download_image(url: str) -> np.ndarray:
+    """Download image from URL and return as BGR numpy array."""
+    logger.info(f"Downloading: {url[:100]}...")
+    resp = requests.get(url, timeout=120)
+    resp.raise_for_status()
+    arr = np.frombuffer(resp.content, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Failed to decode image from URL")
+    logger.info(f"Downloaded image: {img.shape[1]}x{img.shape[0]}")
+    return img
 
-def detect_scene_type(images):
-    img = images[len(images) // 2]
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+def detect_scene(images: list) -> str:
+    """Detect if scene is interior or exterior based on image characteristics."""
+    ref = images[1]  # Normal exposure
+    hsv = cv2.cvtColor(ref, cv2.COLOR_BGR2HSV)
+    
+    # Check for sky-like regions (high value, low-mid saturation, blue-ish hue)
     h, s, v = cv2.split(hsv)
-
-    top_portion = h[:img.shape[0] // 3, :]
-    top_s = s[:img.shape[0] // 3, :]
-    top_v = v[:img.shape[0] // 3, :]
-
-    sky_mask = ((top_portion > 85) & (top_portion < 135) &
-                (top_s > 30) & (top_v > 100))
+    sky_mask = (h > 90) & (h < 130) & (s > 30) & (v > 150)
     sky_ratio = np.sum(sky_mask) / sky_mask.size
-    avg_top_brightness = np.mean(top_v)
-
-    green_mask = ((h > 30) & (h < 85) & (s > 30))
+    
+    # Check for green vegetation
+    green_mask = (h > 35) & (h < 85) & (s > 40) & (v > 50)
     green_ratio = np.sum(green_mask) / green_mask.size
+    
+    if sky_ratio > 0.08 or green_ratio > 0.15:
+        logger.info(f"Scene detected: EXTERIOR (sky={sky_ratio:.3f}, green={green_ratio:.3f})")
+        return "exterior"
+    else:
+        logger.info(f"Scene detected: INTERIOR (sky={sky_ratio:.3f}, green={green_ratio:.3f})")
+        return "interior"
 
-    is_exterior = (sky_ratio > 0.08 or avg_top_brightness > 170 or green_ratio > 0.15)
-    scene = "exterior" if is_exterior else "interior"
-    print(f"[Scene Detection] Type: {scene} | Sky: {sky_ratio:.2%} | "
-          f"Top brightness: {avg_top_brightness:.0f} | Green: {green_ratio:.2%}")
-    return scene
 
-
-# ─── Alignment ───────────────────────────────────────────────────────
-
-def align_images_ecc(images):
-    if len(images) < 2:
-        return images
-
-    ref = images[len(images) // 2]
+def align_images(images: list) -> list:
+    """Sub-pixel alignment using ECC (Enhanced Correlation Coefficient)."""
+    logger.info("Aligning images...")
+    ref = images[1]  # Normal exposure as reference
     ref_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
-    aligned = []
-
-    for i, img in enumerate(images):
-        if i == len(images) // 2:
-            aligned.append(ref)
-            continue
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        warp_matrix = np.eye(2, 3, dtype=np.float32)
-
+    
+    aligned = [None, ref, None]
+    warp_mode = cv2.MOTION_TRANSLATION
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+    
+    for i in [0, 2]:
         try:
-            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
-            _, warp_matrix = cv2.findTransformECC(
-                ref_gray, gray, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
-            )
-            result = cv2.warpAffine(
-                img, warp_matrix, (ref.shape[1], ref.shape[0]),
+            img_gray = cv2.cvtColor(images[i], cv2.COLOR_BGR2GRAY)
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
+            _, warp_matrix = cv2.findTransformECC(ref_gray, img_gray, warp_matrix, warp_mode, criteria)
+            h, w = ref.shape[:2]
+            aligned[i] = cv2.warpAffine(
+                images[i], warp_matrix, (w, h),
                 flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP,
-                borderMode=cv2.BORDER_REFLECT101
+                borderMode=cv2.BORDER_REFLECT
             )
-            print(f"  [Align] Frame {i}: ECC success")
-            aligned.append(result)
-        except cv2.error:
-            print(f"  [Align] Frame {i}: ECC failed, trying ORB fallback")
-            try:
-                orb = cv2.ORB_create(5000)
-                kp1, des1 = orb.detectAndCompute(ref_gray, None)
-                kp2, des2 = orb.detectAndCompute(gray, None)
-
-                if des1 is not None and des2 is not None:
-                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-                    matches = bf.match(des1, des2)
-                    matches = sorted(matches, key=lambda x: x.distance)[:100]
-
-                    if len(matches) >= 10:
-                        pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-                        pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
-                        M, _ = cv2.estimateAffinePartial2D(pts2, pts1)
-                        if M is not None:
-                            result = cv2.warpAffine(
-                                img, M, (ref.shape[1], ref.shape[0]),
-                                flags=cv2.INTER_LANCZOS4,
-                                borderMode=cv2.BORDER_REFLECT101
-                            )
-                            print(f"  [Align] Frame {i}: ORB success ({len(matches)} matches)")
-                            aligned.append(result)
-                            continue
-
-                print(f"  [Align] Frame {i}: ORB fallback failed, using unaligned")
-                aligned.append(img)
-            except Exception as e:
-                print(f"  [Align] Frame {i}: ORB error: {e}, using unaligned")
-                aligned.append(img)
-
+            logger.info(f"Image {i} aligned (shift: dx={warp_matrix[0,2]:.2f}, dy={warp_matrix[1,2]:.2f})")
+        except cv2.error as e:
+            logger.warning(f"ECC alignment failed for image {i}, using original: {e}")
+            aligned[i] = images[i]
+    
     return aligned
 
 
-# ─── Ghost Removal ───────────────────────────────────────────────────
-
-def remove_ghosts(images):
-    if len(images) < 2:
-        return images
-
-    ref = images[len(images) // 2]
-    ref_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    result = []
-
-    for i, img in enumerate(images):
-        if i == len(images) // 2:
-            result.append(img)
-            continue
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        diff = np.abs(ref_gray - gray)
-        _, ghost_mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-        ghost_mask = ghost_mask.astype(np.uint8)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        ghost_mask = cv2.morphologyEx(ghost_mask, cv2.MORPH_CLOSE, kernel)
-        ghost_mask = cv2.GaussianBlur(ghost_mask, (21, 21), 0)
-
-        ghost_ratio = np.sum(ghost_mask > 127) / ghost_mask.size
-        if ghost_ratio > 0.005:
-            mask_3ch = cv2.merge([ghost_mask, ghost_mask, ghost_mask]) / 255.0
-            blended = (ref * mask_3ch + img * (1 - mask_3ch)).astype(np.uint8)
-            print(f"  [Ghost] Frame {i}: masked {ghost_ratio:.2%}")
-            result.append(blended)
-        else:
-            result.append(img)
-
-    return result
-
-
-# ─── Exposure Fusion ─────────────────────────────────────────────────
-
-def exposure_fusion(images, scene_type="interior"):
-    merge = cv2.createMergeMertens(
-        contrast_weight=1.0,
-        saturation_weight=1.0,
-        exposure_weight=1.0
-    )
-
-    n = len(images)
-    mid = n // 2
-
-    if scene_type == "exterior":
-        weights = np.ones(n, dtype=np.float32)
-        weights[0] = 1.4
-        weights[mid] = 1.0
-        weights[-1] = 0.7
-    else:
-        weights = np.ones(n, dtype=np.float32)
-        weights[mid] = 1.3
-        weights[-1] = 1.1
-        weights[0] = 0.8
-
-    weighted = []
-    for i, img in enumerate(images):
-        w = weights[i] if i < len(weights) else 1.0
-        adjusted = np.clip(img.astype(np.float32) * w, 0, 255).astype(np.uint8)
-        weighted.append(adjusted)
-
-    fusion = merge.process(weighted)
-    result = np.clip(fusion * 255, 0, 255).astype(np.uint8)
-    return result
-
-
-# ─── LAB-Only Tone Mapping ──────────────────────────────────────────
-
-def apply_lab_tone_mapping(img, scene_type="interior"):
-    """
-    S-curve and gamma on L channel ONLY — a/b channels untouched.
-    Reduced strength to avoid desaturation of natural tones.
-    """
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l_float = l.astype(np.float32) / 255.0
-
-    s_strength = 0.42 if scene_type == "exterior" else 0.35
-    x = l_float
-    curved = 1.0 / (1.0 + np.exp(-((x - 0.5) * 10 * s_strength)))
-    l_float = x * (1 - s_strength * 0.5) + curved * (s_strength * 0.5)
-
-    gamma = 0.93 if scene_type == "exterior" else 0.95
-    l_float = np.power(np.clip(l_float, 0, 1), 1.0 / gamma)
-
-    l_out = np.clip(l_float * 255, 0, 255).astype(np.uint8)
-    lab_out = cv2.merge([l_out, a, b])
-    result = cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
-
-    print(f"  [ToneMap] LAB-only — S-curve: {s_strength}, Gamma: {gamma} (scene: {scene_type})")
-    return result
-
-
-# ─── Floor/Surface Tone Preservation ────────────────────────────────
-
-def capture_surface_reference(img):
-    """Capture LAB color signature of floor region BEFORE any processing."""
-    h, w = img.shape[:2]
-    floor_region = img[int(h * 0.6):, :]
-    lab = cv2.cvtColor(floor_region, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    ref = {
-        "a_mean": np.mean(a.astype(np.float32)),
-        "b_mean": np.mean(b.astype(np.float32)),
-        "a_std": np.std(a.astype(np.float32)),
-        "b_std": np.std(b.astype(np.float32)),
-    }
-    print(f"  [FloorRef] Captured — a: {ref['a_mean']:.1f}, b: {ref['b_mean']:.1f}")
-    return ref
-
-
-def restore_surface_tones(img, reference):
-    """Correct any color drift on floor surfaces after processing."""
-    h, w = img.shape[:2]
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    floor_a = a[int(h * 0.6):, :].astype(np.float32)
-    floor_b = b[int(h * 0.6):, :].astype(np.float32)
-    curr_a_mean = np.mean(floor_a)
-    curr_b_mean = np.mean(floor_b)
-
-    a_drift = curr_a_mean - reference["a_mean"]
-    b_drift = curr_b_mean - reference["b_mean"]
-
-    print(f"  [FloorRestore] Drift — a: {a_drift:+.1f}, b: {b_drift:+.1f}")
-
-    if abs(a_drift) < 0.8 and abs(b_drift) < 0.8:
-        print(f"  [FloorRestore] Within tolerance — no correction needed")
-        return img
-
-    a_float = a.astype(np.float32)
-    b_float = b.astype(np.float32)
-
-    gradient = np.zeros((h, w), dtype=np.float32)
-    fade_start = int(h * 0.30)
-    for y in range(fade_start, h):
-        gradient[y, :] = (y - fade_start) / (h - fade_start)
-
-    correction_strength = 0.90
-    a_float -= a_drift * correction_strength * gradient
-    b_float -= b_drift * correction_strength * gradient
-
-    a_out = np.clip(a_float, 0, 255).astype(np.uint8)
-    b_out = np.clip(b_float, 0, 255).astype(np.uint8)
-
-    lab_out = cv2.merge([l, a_out, b_out])
-    result = cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
-    print(f"  [FloorRestore] Corrected a by {-a_drift * correction_strength:+.1f}, "
-          f"b by {-b_drift * correction_strength:+.1f}")
-    return result
-
-
-# ─── Edge-Aware Contrast ────────────────────────────────────────────
-
-def apply_edge_aware_contrast(img, scene_type="interior"):
-    """Local contrast on L-channel only — zero color interference."""
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-    l_float = l_channel.astype(np.float32) / 255.0
-
-    radius = 16 if scene_type == "interior" else 20
-
-    base = cv2.bilateralFilter(l_float, d=radius, sigmaColor=0.1, sigmaSpace=radius)
-    detail = l_float - base
-
-    detail_boost = 1.4 if scene_type == "interior" else 1.3
-
-    shadow_mask = np.clip(1.0 - base, 0, 1) ** 0.5
-    highlight_mask = np.clip(base - 0.7, 0, 0.3) / 0.3
-
-    boosted_detail = detail * (detail_boost + shadow_mask * 0.2 - highlight_mask * 0.2)
-
-    enhanced = base + boosted_detail
-    enhanced = np.clip(enhanced * 255, 0, 255).astype(np.uint8)
-
-    lab_out = cv2.merge([enhanced, a_channel, b_channel])
-    return cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
-
-
-# ─── Adaptive Denoising ─────────────────────────────────────────────
-
-def estimate_noise_level(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    crop = gray[h // 4:3 * h // 4, w // 4:3 * w // 4]
-    sigma = np.sqrt(np.maximum(cv2.Laplacian(crop, cv2.CV_64F).var() * 0.5, 0))
-    return sigma
-
-
-def apply_adaptive_denoising(img):
-    noise_level = estimate_noise_level(img)
-    print(f"  [Denoise] Estimated noise level: {noise_level:.1f}")
-
-    if noise_level < 8:
-        print(f"  [Denoise] Clean image — skipping")
-        return img
-    elif noise_level < 15:
-        h_lum, h_color = 2, 2
-    elif noise_level < 30:
-        h_lum, h_color = 4, 3
-    else:
-        h_lum, h_color = 7, 5
-
-    print(f"  [Denoise] Applying (h_lum={h_lum}, h_color={h_color})")
-    result = cv2.fastNlMeansDenoisingColored(img, None, h_lum, h_color, 7, 21)
-    return result
-
-
-# ─── Auto White Balance (gentle warm-clamp) ─────────────────────────
-
-def apply_auto_white_balance(img, scene_type="interior"):
-    """
-    Gentle WB: allows natural wood/material warmth through while
-    preventing artificial warm casts. scale_r capped at 1.03,
-    overall strength reduced to 0.12.
-    """
-    img_float = img.astype(np.float32)
-    b, g, r = cv2.split(img_float)
-
-    avg_b, avg_g, avg_r = np.mean(b), np.mean(g), np.mean(r)
-    avg_all = (avg_b + avg_g + avg_r) / 3.0
-
-    scale_b = avg_all / (avg_b + 1e-6)
-    scale_g = avg_all / (avg_g + 1e-6)
-    scale_r = avg_all / (avg_r + 1e-6)
-
-    max_correction = 1.12
-    min_correction = 1.0 / max_correction
-
-    scale_b = np.clip(scale_b, min_correction, max_correction)
-    scale_g = np.clip(scale_g, min_correction, max_correction)
-    scale_r = np.clip(scale_r, min_correction, max_correction)
-
-    strength = 0.12 if scene_type == "interior" else 0.20
-
-    scale_b = 1.0 + (scale_b - 1.0) * strength
-    scale_g = 1.0 + (scale_g - 1.0) * strength
-    scale_r = 1.0 + (scale_r - 1.0) * strength
-
-    # SOFT WARM CLAMP: allow slight natural warmth (up to 1.03)
-    if scene_type == "interior":
-        scale_r = min(scale_r, 1.03)
-        scale_b = max(scale_b, 0.98)
-
-    corrected = cv2.merge([
-        np.clip(b * scale_b, 0, 255),
-        np.clip(g * scale_g, 0, 255),
-        np.clip(r * scale_r, 0, 255)
-    ]).astype(np.uint8)
-
-    print(f"  [WB] Corrections — B: {scale_b:.3f}, G: {scale_g:.3f}, R: {scale_r:.3f} "
-          f"(scene: {scene_type}, strength: {strength})")
-    return corrected
-
-
-# ─── Color Correction (material-aware) ──────────────────────────────
-
-def apply_color_correction_pro(img, scene_type="interior"):
-    """
-    Selective neutral push with higher threshold (12.0).
-    Wood floors and warm cabinets are PRESERVED, not pushed toward gray.
-    """
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    a_float = a.astype(np.float32)
-    b_float = b.astype(np.float32)
-
-    chroma = np.sqrt((a_float - 128) ** 2 + (b_float - 128) ** 2)
-
-    neutral_threshold = 12.0 if scene_type == "interior" else 8.0
-    cast_mask = np.clip((chroma - neutral_threshold) / 10.0, 0, 1)
-
-    neutral_strength = 0.03 if scene_type == "interior" else 0.05
-    a_corrected = a_float + (128.0 - a_float) * neutral_strength * cast_mask
-    b_corrected = b_float + (128.0 - b_float) * neutral_strength * cast_mask
-
-    max_chroma = np.percentile(chroma, 95) + 1e-6
-    vibrance_mask = 1.0 - np.clip(chroma / max_chroma, 0, 1)
-
-    vibrance_amount = 0.10 if scene_type == "interior" else 0.15
-    a_corrected = a_corrected + (a_corrected - 128) * vibrance_mask * vibrance_amount
-    b_corrected = b_corrected + (b_corrected - 128) * vibrance_mask * vibrance_amount
-
-    a_out = np.clip(a_corrected, 0, 255).astype(np.uint8)
-    b_out = np.clip(b_corrected, 0, 255).astype(np.uint8)
-
-    neutral_pct = np.mean(cast_mask < 0.1) * 100
-    print(f"  [Color] Neutral push: {neutral_strength} | {neutral_pct:.0f}% pixels preserved (threshold: {neutral_threshold})")
-
-    lab_out = cv2.merge([l, a_out, b_out])
-    return cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
-
-
-# ─── Shadow/Highlight Recovery ───────────────────────────────────────
-
-def apply_shadow_highlight_recovery(img, scene_type="interior"):
-    """L-channel only — reduced strength to avoid washed-out look."""
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l_float = l.astype(np.float32) / 255.0
-
-    shadow_threshold = 0.45 if scene_type == "interior" else 0.30
-    shadow_strength = 0.35 if scene_type == "interior" else 0.15
-
-    shadow_mask = np.clip((shadow_threshold - l_float) / shadow_threshold, 0, 1)
-    shadow_lift = shadow_mask ** 2 * shadow_strength
-    l_float = l_float + shadow_lift
-
-    highlight_threshold = 0.92
-    highlight_mask = np.clip((l_float - highlight_threshold) / (1.0 - highlight_threshold), 0, 1)
-    l_float = l_float - highlight_mask * 0.06
-
-    l_out = np.clip(l_float * 255, 0, 255).astype(np.uint8)
-    lab_out = cv2.merge([l_out, a, b])
-    return cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
-
-
-# ─── Brightness Auto-Fix ─────────────────────────────────────────────
-
-def apply_final_brightness_contrast(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    mean_brightness = np.mean(gray)
-
-    print(f"  [Brightness] Mean: {mean_brightness:.0f}")
-
-    result = img.copy()
-
-    if mean_brightness < 90:
-        boost = min((100 - mean_brightness) / 100 * 0.15, 0.12)
-        lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        l = np.clip(l.astype(np.float32) * (1 + boost) + 5, 0, 255).astype(np.uint8)
-        result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        print(f"  [Brightness] Boosted by {boost:.1%}")
-    elif mean_brightness > 190:
-        reduce = min((mean_brightness - 180) / 100 * 0.1, 0.08)
-        lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        l = np.clip(l.astype(np.float32) * (1 - reduce), 0, 255).astype(np.uint8)
-        result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        print(f"  [Brightness] Reduced by {reduce:.1%}")
-
-    return result
-
-
-# ─── LAB-Only Sharpening ─────────────────────────────────────────────
-
-def apply_pro_sharpening(img):
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-
-    l_float = l_channel.astype(np.float32)
-
-    blur_fine = cv2.GaussianBlur(l_float, (3, 3), 0.8)
-    detail_fine = l_float - blur_fine
-
-    blur_med = cv2.GaussianBlur(l_float, (5, 5), 1.5)
-    detail_med = l_float - blur_med
-
-    max_detail = 12.0
-    detail_fine = np.clip(detail_fine, -max_detail, max_detail)
-    detail_med = np.clip(detail_med, -max_detail, max_detail)
-
-    sharpened = l_float + detail_fine * 1.2 + detail_med * 0.4
-    sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
-
-    lab_sharpened = cv2.merge([sharpened, a_channel, b_channel])
-    return cv2.cvtColor(lab_sharpened, cv2.COLOR_LAB2BGR)
-
-
-# ─── Perspective Correction ──────────────────────────────────────────
-
-def apply_perspective_correction(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
-                            minLineLength=img.shape[0] // 4, maxLineGap=10)
-
-    if lines is None:
-        return img
-
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if abs(x2 - x1) < abs(y2 - y1):
-            angle = np.degrees(np.arctan2(x2 - x1, y2 - y1))
-            if abs(angle) < 5:
-                angles.append(angle)
-
-    if len(angles) < 3:
-        return img
-
-    median_angle = np.median(angles)
-
-    if abs(median_angle) < 0.3 or abs(median_angle) > 5:
-        return img
-
-    h, w = img.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-    result = cv2.warpAffine(img, M, (w, h),
-                            flags=cv2.INTER_LANCZOS4,
-                            borderMode=cv2.BORDER_REFLECT101)
-    print(f"  [Perspective] Corrected by {median_angle:.2f}°")
-    return result
-
-
-# ─── Main Pipeline ───────────────────────────────────────────────────
-
-def process_hdr(images, style="natural"):
-    print(f"[HDR Engine v5.2] Processing {len(images)} frames, style: {style}")
-    t0 = time.time()
-
-    scene_type = detect_scene_type(images)
-
-    print("[Step 1/9] Aligning frames...")
-    aligned = align_images_ecc(images)
-
-    print("[Step 2/9] Ghost removal...")
-    deghosted = remove_ghosts(aligned)
-
-    # Capture floor reference from MIDDLE BRACKET (before fusion)
-    print("[Step 3/9] Capturing surface tone reference from source bracket...")
-    floor_ref = capture_surface_reference(images[len(images) // 2])
-
-    print("[Step 4/9] Exposure fusion...")
-    merged = exposure_fusion(deghosted, scene_type)
-
-    print("[Step 5/9] White balance (gentle warm-clamp)...")
-    merged = apply_auto_white_balance(merged, scene_type)
-
-    print("[Step 6/9] LAB tone mapping...")
-    merged = apply_lab_tone_mapping(merged, scene_type)
-
-    print("[Step 7/9] Edge-aware contrast...")
-    merged = apply_edge_aware_contrast(merged, scene_type)
-
-    print("[Step 8/9] Color correction (material-aware)...")
-    merged = apply_color_correction_pro(merged, scene_type)
-
-    print("[Step 9/9] Shadow/highlight recovery...")
-    merged = apply_shadow_highlight_recovery(merged, scene_type)
-
-    merged = apply_adaptive_denoising(merged)
-    merged = apply_final_brightness_contrast(merged)
-
-    print("[Floor Restore] Checking for color drift vs source...")
-    merged = restore_surface_tones(merged, floor_ref)
-
-    merged = apply_perspective_correction(merged)
-    merged = apply_pro_sharpening(merged)
-
-    elapsed = time.time() - t0
-    print(f"[HDR Engine v5.2] Done in {elapsed:.1f}s (scene: {scene_type})")
+def remove_ghosts(images: list, merged: np.ndarray) -> np.ndarray:
+    """Remove ghosting artifacts from moving objects."""
+    ref_gray = cv2.cvtColor(images[1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    
+    for i in [0, 2]:
+        img_gray = cv2.cvtColor(images[i], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        diff = np.abs(ref_gray - img_gray)
+        ghost_mask = (diff > 30).astype(np.float32)
+        ghost_mask = cv2.GaussianBlur(ghost_mask, (15, 15), 0)
+        
+        for c in range(3):
+            merged[:, :, c] = (
+                merged[:, :, c] * (1 - ghost_mask) +
+                images[1][:, :, c] * ghost_mask
+            ).astype(np.uint8)
+    
     return merged
 
 
-# ─── Job Handler ─────────────────────────────────────────────────────
+def exposure_fusion(images: list) -> np.ndarray:
+    """Mertens exposure fusion — the core HDR merge."""
+    logger.info("Running Mertens exposure fusion...")
+    merge_mertens = cv2.createMergeMertens(
+        contrast_weight=1.0,
+        saturation_weight=1.0,
+        exposure_weight=1.0,
+    )
+    fusion = merge_mertens.process(images)
+    # Clip and convert to 8-bit
+    fusion = np.clip(fusion * 255, 0, 255).astype(np.uint8)
+    return fusion
 
-def process_job(payload):
-    job_id = payload.get("jobId") or payload.get("job_id") or "unknown"
-    input_urls = payload.get("inputUrls") or payload.get("input_urls") or []
+
+def apply_tone_mapping(img: np.ndarray, scene: str) -> np.ndarray:
+    """LAB-only tone mapping to preserve original colors."""
+    logger.info("Applying LAB tone mapping...")
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0]
+    
+    # Gamma correction (0.91 — subtle lift)
+    gamma = 0.91
+    l_norm = l_channel / 255.0
+    l_norm = np.power(l_norm, gamma)
+    
+    # S-curve for contrast (strength 0.50)
+    s_strength = 0.50
+    l_scurve = l_norm - s_strength * (l_norm - 0.5) * l_norm * (1 - l_norm) * 4
+    l_scurve = np.clip(l_scurve, 0, 1)
+    
+    lab[:, :, 0] = l_scurve * 255.0
+    lab = np.clip(lab, 0, 255).astype(np.uint8)
+    result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return result
+
+
+def apply_white_balance(img: np.ndarray) -> np.ndarray:
+    """Balanced AWB with warm-clamp (red boost capped at 1.03)."""
+    logger.info("Applying white balance...")
+    strength = 0.12
+    
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    avg_a = np.mean(lab[:, :, 1])
+    avg_b = np.mean(lab[:, :, 2])
+    
+    # Shift toward neutral (128 is neutral in LAB)
+    lab[:, :, 1] = lab[:, :, 1] - strength * (avg_a - 128)
+    lab[:, :, 2] = lab[:, :, 2] - strength * (avg_b - 128)
+    
+    lab = np.clip(lab, 0, 255).astype(np.uint8)
+    result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    # Warm-clamp: cap red channel boost at 1.03x
+    b, g, r = cv2.split(result)
+    _, g_orig, _ = cv2.split(img)
+    r_ratio = np.mean(r.astype(np.float32)) / max(np.mean(g.astype(np.float32)), 1)
+    r_orig_ratio = np.mean(cv2.split(img)[2].astype(np.float32)) / max(np.mean(g_orig.astype(np.float32)), 1)
+    
+    if r_ratio > r_orig_ratio * 1.03:
+        scale = (r_orig_ratio * 1.03) / max(r_ratio, 0.01)
+        r = np.clip(r.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        result = cv2.merge([b, g, r])
+    
+    return result
+
+
+def recover_shadows(img: np.ndarray, dark_img: np.ndarray) -> np.ndarray:
+    """Enhanced shadow recovery (0.45 threshold, 0.35 strength)."""
+    logger.info("Recovering shadows...")
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0] / 255.0
+    
+    threshold = 0.45
+    strength = 0.35
+    
+    shadow_mask = np.clip((threshold - l_channel) / threshold, 0, 1)
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (31, 31), 0)
+    
+    # Lift shadows
+    lift = shadow_mask * strength * (1 - l_channel)
+    l_channel = l_channel + lift
+    
+    lab[:, :, 0] = np.clip(l_channel * 255, 0, 255)
+    lab = lab.astype(np.uint8)
+    result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return result
+
+
+def preserve_surface_tones(img: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Surface tone preservation using pre-fusion LAB signatures."""
+    logger.info("Preserving surface tones...")
+    lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_ref = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float32)
+    
+    # Identify large uniform surfaces (walls, floors, ceilings)
+    l_ref = lab_ref[:, :, 0]
+    threshold = 0.80  # 80% threshold
+    
+    # Low-texture regions = surfaces
+    grad_x = cv2.Sobel(l_ref, cv2.CV_32F, 1, 0, ksize=5)
+    grad_y = cv2.Sobel(l_ref, cv2.CV_32F, 0, 1, ksize=5)
+    gradient_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    max_grad = np.max(gradient_mag) if np.max(gradient_mag) > 0 else 1
+    surface_mask = (gradient_mag / max_grad < (1 - threshold)).astype(np.float32)
+    surface_mask = cv2.GaussianBlur(surface_mask, (21, 21), 0)
+    
+    # Blend color channels toward reference on surfaces
+    for c in [1, 2]:  # a and b channels only
+        lab_img[:, :, c] = (
+            lab_img[:, :, c] * (1 - surface_mask * 0.6) +
+            lab_ref[:, :, c] * (surface_mask * 0.6)
+        )
+    
+    lab_img = np.clip(lab_img, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab_img, cv2.COLOR_LAB2BGR)
+
+
+def correct_perspective(img: np.ndarray) -> np.ndarray:
+    """Perspective correction using Hough line detection."""
+    logger.info("Correcting perspective...")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                            minLineLength=img.shape[0] // 4, maxLineGap=20)
+    
+    if lines is None or len(lines) < 3:
+        logger.info("Not enough lines detected, skipping perspective correction")
+        return img
+    
+    # Find near-vertical lines
+    vertical_angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if abs(x2 - x1) < 1:
+            continue
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        # Near-vertical: close to ±90°
+        if 70 < abs(angle) < 110:
+            vertical_angles.append(angle)
+    
+    if len(vertical_angles) < 2:
+        logger.info("Not enough vertical lines, skipping correction")
+        return img
+    
+    # Median deviation from true vertical
+    median_angle = np.median(vertical_angles)
+    correction = 90 - abs(median_angle) if median_angle > 0 else -(90 - abs(median_angle))
+    
+    if abs(correction) < 0.3:
+        logger.info(f"Negligible correction ({correction:.2f}°), skipping")
+        return img
+    
+    if abs(correction) > 5:
+        logger.info(f"Correction too large ({correction:.2f}°), capping at 5°")
+        correction = np.clip(correction, -5, 5)
+    
+    logger.info(f"Applying keystone correction: {correction:.2f}°")
+    h, w = img.shape[:2]
+    
+    # Simple rotation for small corrections
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), correction, 1.0)
+    result = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LANCZOS4,
+                            borderMode=cv2.BORDER_REFLECT)
+    return result
+
+
+def apply_edge_aware_contrast(img: np.ndarray) -> np.ndarray:
+    """Edge-aware local contrast enhancement."""
+    logger.info("Applying edge-aware contrast...")
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel = lab[:, :, 0]
+    
+    # CLAHE with conservative settings
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l_channel)
+    
+    # Blend 40% enhanced with 60% original to keep it subtle
+    l_blended = cv2.addWeighted(l_channel, 0.6, l_enhanced, 0.4, 0)
+    lab[:, :, 0] = l_blended
+    
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def apply_denoising(img: np.ndarray, scene: str) -> np.ndarray:
+    """Adaptive denoising — stronger for interiors."""
+    logger.info(f"Applying denoising (scene={scene})...")
+    h_lum = 2 if scene == "exterior" else 3
+    h_color = 2
+    # MUST use positional args for OpenCV compatibility on Railway
+    denoised = cv2.fastNlMeansDenoisingColored(img, None, h_lum, h_color, 7, 21)
+    return denoised
+
+
+def apply_lens_correction(img: np.ndarray) -> np.ndarray:
+    """Lens distortion correction — removes barrel/pincushion distortion."""
+    logger.info("Applying lens correction...")
+    h, w = img.shape[:2]
+    
+    # Estimate a mild barrel distortion correction
+    # These are conservative values that work for typical wide-angle real estate lenses
+    focal_length = w * 0.8  # Approximate focal length
+    cx, cy = w / 2, h / 2
+    
+    camera_matrix = np.array([
+        [focal_length, 0, cx],
+        [0, focal_length, cy],
+        [0, 0, 1]
+    ], dtype=np.float64)
+    
+    # Mild barrel distortion correction coefficients
+    dist_coeffs = np.array([-0.08, 0.02, 0, 0, 0], dtype=np.float64)
+    
+    new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
+        camera_matrix, dist_coeffs, (w, h), 0.3, (w, h)
+    )
+    
+    corrected = cv2.undistort(img, camera_matrix, dist_coeffs, None, new_camera_matrix)
+    
+    # Crop to ROI if valid
+    x, y, rw, rh = roi
+    if rw > w * 0.9 and rh > h * 0.9:
+        corrected = corrected[y:y+rh, x:x+rw]
+        corrected = cv2.resize(corrected, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    
+    return corrected
+
+
+def apply_dehaze(img: np.ndarray, strength: float = 0.2) -> np.ndarray:
+    """Dark channel prior dehazing for clarity."""
+    logger.info(f"Applying dehaze (strength={strength})...")
+    img_f = img.astype(np.float64) / 255.0
+    
+    # Dark channel
+    kernel_size = 15
+    dark = np.min(img_f, axis=2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    dark_channel = cv2.erode(dark, kernel)
+    
+    # Atmospheric light estimate
+    flat_dark = dark_channel.flatten()
+    num_pixels = max(int(flat_dark.size * 0.001), 1)
+    indices = np.argsort(flat_dark)[-num_pixels:]
+    
+    atm_light = np.zeros(3)
+    for c in range(3):
+        flat_c = img_f[:, :, c].flatten()
+        atm_light[c] = np.max(flat_c[indices])
+    atm_light = np.clip(atm_light, 0.5, 1.0)
+    
+    # Transmission estimate
+    norm = img_f / atm_light[np.newaxis, np.newaxis, :]
+    norm_dark = np.min(norm, axis=2)
+    kernel_t = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    transmission = 1 - strength * cv2.erode(norm_dark, kernel_t)
+    transmission = np.clip(transmission, 0.1, 1.0)
+    
+    # Guided filter refinement (simplified)
+    transmission = cv2.GaussianBlur(transmission, (31, 31), 0)
+    
+    # Recover scene
+    result = np.zeros_like(img_f)
+    for c in range(3):
+        result[:, :, c] = (img_f[:, :, c] - atm_light[c]) / np.maximum(transmission, 0.1) + atm_light[c]
+    
+    result = np.clip(result * 255, 0, 255).astype(np.uint8)
+    return result
+
+
+def apply_highlight_recovery(img: np.ndarray, dark_img: np.ndarray) -> np.ndarray:
+    """Recover blown highlights using the dark exposure."""
+    logger.info("Recovering highlights...")
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_dark = cv2.cvtColor(dark_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    
+    l_channel = lab[:, :, 0] / 255.0
+    
+    # Highlight mask: pixels above 85% brightness
+    highlight_threshold = 0.85
+    highlight_mask = np.clip((l_channel - highlight_threshold) / (1 - highlight_threshold), 0, 1)
+    highlight_mask = cv2.GaussianBlur(highlight_mask, (21, 21), 0)
+    
+    # Blend from dark exposure in highlight regions
+    blend_strength = 0.7
+    for c in range(3):
+        lab[:, :, c] = (
+            lab[:, :, c] * (1 - highlight_mask * blend_strength) +
+            lab_dark[:, :, c] * (highlight_mask * blend_strength)
+        )
+    
+    lab = np.clip(lab, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def apply_sharpening(img: np.ndarray) -> np.ndarray:
+    """Unsharp mask for architectural sharpness."""
+    logger.info("Applying sharpening...")
+    gaussian = cv2.GaussianBlur(img, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(img, 1.3, gaussian, -0.3, 0)
+    return sharpened
+
+
+def process_job(payload: dict):
+    """Main HDR processing pipeline."""
+    job_id = payload["job_id"]
+    input_urls = payload["input_urls"]
     style = payload.get("style", "natural")
-    webhook_url = payload.get("webhookUrl") or payload.get("webhook_url")
-    webhook_secret = payload.get("webhookSecret") or payload.get("webhook_secret")
+    webhook_url = payload.get("webhook_url")
+    webhook_secret = payload.get("webhook_secret")
 
-    print(f"\n{'='*60}")
-    print(f"[Job {job_id}] Starting HDR processing (v5.2)")
-    print(f"[Job {job_id}] Inputs: {len(input_urls)}, Style: {style}")
-    print(f"[Job {job_id}] Webhook: {'yes' if webhook_url else 'no'}")
-    print(f"{'='*60}")
+    logger.info(f"[Worker] Starting job {job_id}, style={style}, inputs={len(input_urls)}")
 
     try:
+        # 1. Download all input images
         images = []
-        for i, url in enumerate(input_urls):
-            print(f"[Job {job_id}] Downloading image {i+1}/{len(input_urls)}...")
-            resp = requests.get(url, timeout=120)
-            resp.raise_for_status()
-            arr = np.frombuffer(resp.content, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError(f"Failed to decode image {i+1}")
-            print(f"[Job {job_id}] Image {i+1}: {img.shape[1]}x{img.shape[0]}")
-            images.append(img)
+        for url in input_urls:
+            images.append(download_image(url))
+        
+        logger.info(f"[Worker] Downloaded {len(images)} images")
+        
+        # Store reference for surface tone preservation
+        reference_normal = images[1].copy()
+        
+        # 2. Scene detection
+        scene = detect_scene(images)
+        
+        # 3. Sub-pixel alignment
+        aligned = align_images(images)
+        
+        # 4. Lens correction on all inputs
+        aligned = [apply_lens_correction(img) for img in aligned]
+        
+        # 5. Exposure fusion (core HDR merge)
+        merged = exposure_fusion(aligned)
+        
+        # 6. Ghost removal
+        merged = remove_ghosts(aligned, merged)
+        
+        # 7. Highlight recovery from dark exposure
+        merged = apply_highlight_recovery(merged, aligned[0])
+        
+        # 8. LAB tone mapping
+        merged = apply_tone_mapping(merged, scene)
+        
+        # 9. White balance
+        merged = apply_white_balance(merged)
+        
+        # 10. Shadow recovery
+        merged = recover_shadows(merged, aligned[0])
+        
+        # 11. Dehaze
+        merged = apply_dehaze(merged, strength=0.2)
+        
+        # 12. Surface tone preservation
+        merged = preserve_surface_tones(merged, reference_normal)
+        
+        # 13. Edge-aware contrast
+        merged = apply_edge_aware_contrast(merged)
+        
+        # 14. Perspective correction
+        merged = correct_perspective(merged)
+        
+        # 15. Adaptive denoising
+        merged = apply_denoising(merged, scene)
+        
+        # 16. Final sharpening
+        merged = apply_sharpening(merged)
 
-        if len(images) < 2:
-            raise ValueError("Need at least 2 images for HDR merge")
+        logger.info(f"[Worker] Processing complete. Output: {merged.shape[1]}x{merged.shape[0]}")
 
-        result = process_hdr(images, style)
+        # Encode result
+        encode_params_final = [cv2.IMWRITE_JPEG_QUALITY, FINAL_JPEG_QUALITY]
+        _, final_buffer = cv2.imencode(".jpg", merged, encode_params_final)
+        final_bytes = final_buffer.tobytes()
+        
+        logger.info(f"[Worker] Final JPEG: {len(final_bytes) / 1024:.1f} KB at {FINAL_JPEG_QUALITY}% quality")
 
-        # Full quality encode for final result
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-        success, encoded = cv2.imencode(".jpg", result, encode_params)
-        if not success:
-            raise ValueError("Failed to encode result image")
-
-        result_bytes = encoded.tobytes()
-        print(f"[Job {job_id}] Result (full quality): {len(result_bytes)/1024:.0f}KB")
-
+        # Send via webhook if configured
         if webhook_url:
-            import base64
-
-            # Re-compress for webhook transfer to prevent timeout
-            # The hdr-webhook edge function re-enhances with AI anyway
-            webhook_quality = 85
-            _, webhook_encoded = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, webhook_quality])
-            webhook_bytes = webhook_encoded.tobytes()
-            print(f"[Job {job_id}] Webhook payload: {len(webhook_bytes)/1024:.0f}KB "
-                  f"(compressed from {len(result_bytes)/1024:.0f}KB)")
-
+            logger.info(f"[Worker] Sending webhook to: {webhook_url}")
+            
+            # Re-encode at lower quality for transfer
+            encode_params_webhook = [cv2.IMWRITE_JPEG_QUALITY, WEBHOOK_JPEG_QUALITY]
+            _, webhook_buffer = cv2.imencode(".jpg", merged, encode_params_webhook)
+            webhook_bytes = webhook_buffer.tobytes()
+            
             result_b64 = base64.b64encode(webhook_bytes).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{result_b64}"
+            
+            logger.info(f"[Worker] Webhook payload: {len(webhook_bytes) / 1024:.1f} KB "
+                        f"(transfer at {WEBHOOK_JPEG_QUALITY}%)")
 
-            callback_payload = {
+            webhook_payload = {
                 "jobId": job_id,
                 "job_id": job_id,
                 "status": "completed",
-                "result": result_b64,
+                "resultImage": data_url,
+                "result_image": data_url,
+                "width": merged.shape[1],
+                "height": merged.shape[0],
             }
 
             headers = {"Content-Type": "application/json"}
             if webhook_secret:
                 headers["X-Webhook-Secret"] = webhook_secret
-                headers["x-webhook-secret"] = webhook_secret
 
-            print(f"[Job {job_id}] Sending webhook to {webhook_url}...")
-            resp = requests.post(
-                webhook_url,
-                json=callback_payload,
-                headers=headers,
-                timeout=120
-            )
-            print(f"[Job {job_id}] Webhook response: {resp.status_code}")
+            try:
+                resp = requests.post(webhook_url, json=webhook_payload, headers=headers, timeout=110)
+                logger.info(f"[Worker] Webhook response: {resp.status_code}")
+                if resp.status_code >= 400:
+                    logger.error(f"[Worker] Webhook failed: {resp.text[:300]}")
+            except Exception as e:
+                logger.error(f"[Worker] Webhook error: {e}")
 
-        print(f"[Job {job_id}] ✅ Complete!")
-        return {"status": "completed", "jobId": job_id}
+        # Store result in Redis for polling fallback
+        # Store as a temporary signed URL or just mark as completed
+        redis_conn.set(f"{STATUS_PREFIX}{job_id}", "completed", ex=3600)
+        # For polling fallback, we'd need to store the image somewhere accessible
+        # The webhook is the primary delivery mechanism
+        
+        logger.info(f"[Worker] Job {job_id} completed successfully")
+        return {"status": "completed", "job_id": job_id}
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"[Job {job_id}] ❌ Error: {error_msg}")
-        traceback.print_exc()
+        logger.error(f"[Worker] Job {job_id} FAILED: {e}", exc_info=True)
+        redis_conn.set(f"{STATUS_PREFIX}{job_id}", "failed", ex=3600)
+        redis_conn.set(f"{RESULTS_PREFIX}{job_id}:error", str(e), ex=3600)
 
+        # Try to send failure webhook
         if webhook_url:
             try:
-                error_payload = {
-                    "jobId": job_id,
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": error_msg,
-                }
                 headers = {"Content-Type": "application/json"}
                 if webhook_secret:
                     headers["X-Webhook-Secret"] = webhook_secret
-                    headers["x-webhook-secret"] = webhook_secret
-
-                requests.post(webhook_url, json=error_payload,
-                              headers=headers, timeout=30)
-            except Exception as we:
-                print(f"[Job {job_id}] Webhook error notification failed: {we}")
+                requests.post(webhook_url, json={
+                    "jobId": job_id,
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": str(e),
+                }, headers=headers, timeout=30)
+            except Exception:
+                pass
 
         raise
-
-
-# ─── Worker Entry ─────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    redis_conn = Redis.from_url(REDIS_URL)
-    queue = Queue("hdr", connection=redis_conn)
-    worker = Worker([queue], connection=redis_conn)
-    print("[Worker] Starting HDR worker v5.2 — balanced warmth + webhook compression")
-    worker.work(with_scheduler=False)
