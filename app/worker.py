@@ -15,7 +15,7 @@ redis_conn = redis.from_url(REDIS_URL)
 
 
 # -----------------------------
-# Helpers
+# IO
 # -----------------------------
 def download_image(url: str) -> np.ndarray:
     resp = requests.get(url, timeout=120)
@@ -45,40 +45,23 @@ def safe_resize_like(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
     return cv2.resize(img, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_LANCZOS4)
 
 
-def luminance_L(img_bgr: np.ndarray) -> np.ndarray:
+# -----------------------------
+# Brightness / ordering
+# -----------------------------
+def luminance_L01(img_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     return lab[:, :, 0].astype(np.float32) / 255.0
 
 
-# -----------------------------
-# Scene detection
-# -----------------------------
-def detect_scene(images: list) -> str:
-    img = images[len(images) // 2]
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    _, s, v = cv2.split(hsv)
-    mean_sat = float(np.mean(s))
-    bright_pct = float(np.sum(v > 200)) / v.size
-    if bright_pct > 0.25 and mean_sat > 60:
-        return "exterior"
-    return "interior"
-
-
-# -----------------------------
-# Ordering: random/dark/normal/bright
-# Always sorts to be safe because user upload order is inconsistent.
-# -----------------------------
 def sort_by_brightness(images: list) -> list:
-    scores = []
-    for im in images:
-        scores.append(float(np.mean(luminance_L(im))))
-    idx = np.argsort(scores)
+    scores = [float(np.mean(luminance_L01(im))) for im in images]
+    idx = np.argsort(scores)  # darkest -> brightest
     return [images[i] for i in idx]
 
 
 def order_images(images: list, order: str) -> list:
-    # For all orders, we sort by brightness for reliability.
-    # 'order' is kept for future logic if you want strict mode.
+    # We always sort by brightness because user-upload order is unreliable.
+    # order flag kept for UI compatibility.
     return sort_by_brightness(images)
 
 
@@ -103,35 +86,35 @@ def align_images(images: list) -> list:
         try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            warp_matrix = np.eye(2, 3, dtype=np.float32)
-            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+            warp = np.eye(2, 3, dtype=np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 250, 1e-6)
 
             small_ref = cv2.resize(ref_gray, None, fx=0.5, fy=0.5)
             small_gray = cv2.resize(gray, None, fx=0.5, fy=0.5)
 
-            _, warp_matrix = cv2.findTransformECC(
-                small_ref, small_gray, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
+            _, warp = cv2.findTransformECC(
+                small_ref, small_gray, warp, cv2.MOTION_EUCLIDEAN, criteria
             )
-            warp_matrix[0, 2] *= 2
-            warp_matrix[1, 2] *= 2
+
+            warp[0, 2] *= 2
+            warp[1, 2] *= 2
 
             h, w = ref.shape[:2]
-            aligned_img = cv2.warpAffine(
-                img, warp_matrix, (w, h),
+            out = cv2.warpAffine(
+                img, warp, (w, h),
                 flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP,
                 borderMode=cv2.BORDER_REFLECT
             )
-            aligned.append(aligned_img)
-
+            aligned.append(out)
         except Exception as e:
-            print(f"[Worker] Alignment failed for image {i}: {e}")
+            print(f"[Worker] Alignment failed on image {i}: {e}")
             aligned.append(img)
 
     return aligned
 
 
 # -----------------------------
-# Ghost removal
+# Ghost suppression (simple + safe)
 # -----------------------------
 def remove_ghosts(images: list) -> list:
     if len(images) < 3:
@@ -149,87 +132,69 @@ def remove_ghosts(images: list) -> list:
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
         diff = cv2.absdiff(gray, ref_gray)
-        _, mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY)
         mask = mask.astype(np.uint8)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        mask = cv2.GaussianBlur(mask, (21, 21), 0)
+        mask = cv2.dilate(mask, np.ones((13, 13), np.uint8), iterations=1)
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=8)
 
-        alpha = (mask / 255.0)[:, :, np.newaxis]
-        blended = (img.astype(np.float32) * (1 - alpha) + ref.astype(np.float32) * alpha)
+        a = (mask.astype(np.float32) / 255.0)[:, :, None]
+        blended = img.astype(np.float32) * (1 - a) + ref.astype(np.float32) * a
         out.append(np.clip(blended, 0, 255).astype(np.uint8))
 
     return out
 
 
 # -----------------------------
-# Exposure fusion (base)
+# Fusion base (avoid crunchy HDR)
 # -----------------------------
 def exposure_fusion(images: list) -> np.ndarray:
     merge = cv2.createMergeMertens(
-        contrast_weight=1.0,
-        saturation_weight=0.65,   # reduces HDR “crunch”
-        exposure_weight=0.90      # improves balanced exposure
+        contrast_weight=0.95,
+        saturation_weight=0.55,
+        exposure_weight=1.10,
     )
     fusion = merge.process(images)
-    fusion = np.clip(fusion * 255, 0, 255).astype(np.uint8)
+    fusion = np.clip(fusion * 255.0, 0, 255).astype(np.uint8)
     return fusion
 
 
 # -----------------------------
-# Window pull: SAFE + STRONG (halo guarded)
+# Window Pull (AGGRESSIVE but CONTROLLED)
+# Uses DARK frame ONLY where highlights are blown.
+# Includes “mask guard” to stop the whole image turning black.
 # -----------------------------
-def window_pull_soft(fused: np.ndarray, dark: np.ndarray) -> np.ndarray:
-    L = luminance_L(fused)
-    t = np.percentile(L, 96)
+def window_pull(fused: np.ndarray, dark: np.ndarray, strength: float) -> np.ndarray:
+    # Strength: 0.0..1.0
+    L = luminance_L01(fused)
+
+    # highlight threshold (percentile based)
+    t = np.percentile(L, 96.0 if strength < 0.7 else 94.0)
 
     mask = (L >= t).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
-    mask = cv2.dilate(mask, np.ones((13, 13), np.uint8), iterations=2)
 
-    mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=18)
+    # remove speckles & keep smooth areas like windows
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8), iterations=1)
+    mask = cv2.dilate(mask, np.ones((19, 19), np.uint8), iterations=2)
+
+    # feather heavily to avoid halos
+    mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=26)
     mask_f = np.clip(mask_f, 0.0, 1.0)
 
-    # Guard: if mask covers too much, tighten threshold
-    if float(np.mean(mask_f)) > 0.18:
-        t = np.percentile(L, 98)
-        mask = (L >= t).astype(np.uint8) * 255
-        mask = cv2.dilate(mask, np.ones((11, 11), np.uint8), iterations=1)
-        mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=18)
-        mask_f = np.clip(mask_f, 0.0, 1.0)
-
-    m = mask_f * 0.85
-    m3 = np.dstack([m, m, m])
-
-    out = fused.astype(np.float32) * (1.0 - m3) + dark.astype(np.float32) * m3
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def window_pull_strong(fused: np.ndarray, dark: np.ndarray) -> np.ndarray:
-    L = luminance_L(fused)
-
-    t = np.percentile(L, 94)
-    target_max = 0.14
-
+    # GUARD: if mask covers too much, tighten threshold until it’s sane
+    # (this prevents the “black everywhere” disaster you showed)
     for _ in range(8):
+        if float(np.mean(mask_f)) <= 0.14:
+            break
+        t = min(t + 0.02, 0.995)
         mask = (L >= t).astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8), iterations=1)
-        mask = cv2.dilate(mask, np.ones((17, 17), np.uint8), iterations=2)
-
-        mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=24)
+        mask = cv2.dilate(mask, np.ones((17, 17), np.uint8), iterations=1)
+        mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=26)
         mask_f = np.clip(mask_f, 0.0, 1.0)
 
-        if float(np.mean(mask_f)) <= target_max:
-            break
-
-        t = min(t + 1.5, 99.2)
-
-    # extra feather reduces halos
-    mask_f = cv2.GaussianBlur(mask_f, (0, 0), sigmaX=12)
-    mask_f = np.clip(mask_f, 0.0, 1.0)
-
-    m = mask_f * 0.90
+    # blend
+    m = mask_f * (0.55 + 0.40 * strength)  # 0.55..0.95
     m3 = np.dstack([m, m, m])
 
     out = fused.astype(np.float32) * (1.0 - m3) + dark.astype(np.float32) * m3
@@ -237,28 +202,48 @@ def window_pull_strong(fused: np.ndarray, dark: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
-# Brightness + clean look (avoid too dark)
+# Tone / brightness normalization (fix “too dark/grey”)
 # -----------------------------
-def auto_exposure(img: np.ndarray, target_mid: float = 0.58) -> np.ndarray:
+def normalize_exposure(img: np.ndarray, target_mid: float = 0.58) -> np.ndarray:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L = lab[:, :, 0] / 255.0
 
-    med = float(np.median(L))
-    med = max(med, 1e-4)
+    mid = float(np.percentile(L, 50))
+    hi = float(np.percentile(L, 99))
 
-    gain = target_mid / med
-    gain = np.clip(gain, 0.75, 2.60)
+    mid = max(mid, 1e-4)
+    gain = target_mid / mid
+    gain = np.clip(gain, 0.85, 2.50)
 
     L = np.clip(L * gain, 0, 1)
 
-    # gentle shadow lift if dark overall
-    if med < 0.40:
-        L = np.power(L, 0.88)
+    # compress highlights gently so it looks “pro” not blown
+    # keeps ceiling lights from clipping hard
+    if hi > 0.92:
+        L = 1.0 - np.power(1.0 - L, 1.12)
 
-    lab[:, :, 0] = L * 255.0
+    lab[:, :, 0] = np.clip(L * 255.0, 0, 255)
     return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+def filmic_contrast(img: np.ndarray, strength: float = 0.35) -> np.ndarray:
+    # smooth “S-curve” on L channel (no crunchy HDR)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L = lab[:, :, 0] / 255.0
+
+    # sigmoid
+    a = 6.0 * strength + 1.0  # 1..3-ish
+    L2 = 1.0 / (1.0 + np.exp(-a * (L - 0.5)))
+    # mix
+    L = (1 - strength) * L + strength * L2
+
+    lab[:, :, 0] = np.clip(L * 255.0, 0, 255)
+    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+# -----------------------------
+# White balance (safe)
+# -----------------------------
 def balanced_awb(img: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
@@ -266,38 +251,41 @@ def balanced_awb(img: np.ndarray) -> np.ndarray:
     a_mean = float(np.mean(A))
     b_mean = float(np.mean(B))
 
-    strength = 0.10
-    A = A - (a_mean - 128) * strength
-    B = B - (b_mean - 128) * strength
-
-    B = np.clip(B, 128 - 10, 128 + 6)
+    # gentle correction only
+    A = A - (a_mean - 128) * 0.10
+    B = B - (b_mean - 128) * 0.10
 
     lab = cv2.merge([L, np.clip(A, 0, 255), np.clip(B, 0, 255)])
     return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
-def apply_clahe(img: np.ndarray, scene: str) -> np.ndarray:
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
+# -----------------------------
+# Local contrast (“clarity”) WITHOUT halos
+# -----------------------------
+def clarity(img: np.ndarray, amount: float = 0.40) -> np.ndarray:
+    # edge-preserving base
+    base = cv2.bilateralFilter(img, d=0, sigmaColor=40, sigmaSpace=18)
+    detail = img.astype(np.float32) - base.astype(np.float32)
+    out = img.astype(np.float32) + detail * (amount * 1.8)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
-    clip_limit = 1.2 if scene == "interior" else 1.4
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    L = clahe.apply(L)
 
-    return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
+def mild_saturation(img: np.ndarray, sat_boost: float = 0.08) -> np.ndarray:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] *= (1.0 + sat_boost)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
-def adaptive_denoise(img: np.ndarray) -> np.ndarray:
+def denoise(img: np.ndarray) -> np.ndarray:
     return cv2.fastNlMeansDenoisingColored(img, None, 2, 2, 7, 21)
 
 
 def sharpen_soft(img: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-
     blur = cv2.GaussianBlur(L, (0, 0), sigmaX=1.2)
     sharp = cv2.addWeighted(L, 1.22, blur, -0.22, 0)
-
     return cv2.cvtColor(cv2.merge([sharp, A, B]), cv2.COLOR_LAB2BGR)
 
 
@@ -314,8 +302,8 @@ def send_webhook(webhook_url: str, webhook_secret: str | None, payload: dict):
 def process_job(payload: dict):
     job_id = payload["job_id"]
     input_urls = payload["input_urls"]
-    style = payload.get("style", "natural")
-    order = payload.get("order", "random")
+    style = payload.get("style", "natural")           # natural | window_soft | window_strong
+    order = payload.get("order", "random")           # random | dark | normal | bright
     webhook_url = payload.get("webhook_url")
     webhook_secret = payload.get("webhook_secret")
 
@@ -324,67 +312,64 @@ def process_job(payload: dict):
     redis_conn.expire(result_key, 3600)
 
     print(f"[Worker] Processing job {job_id} ({len(input_urls)} imgs) style={style} order={order}")
-    start_time = time.time()
+    start = time.time()
 
     try:
-        # 1) Download
-        images = [download_image(url) for url in input_urls]
+        # Download
+        images = [download_image(u) for u in input_urls]
         if len(images) < 2:
             raise ValueError("Need at least 2 images")
 
-        # 2) Normalize sizes
+        # Normalize sizes
         ref = images[0]
         images = [safe_resize_like(im, ref) for im in images]
 
-        # 3) Sort brightness (so we reliably pick dark/mid/bright)
+        # Brightness order
         images = order_images(images, order)
-        dark_img = images[0]
-        mid_img = images[len(images) // 2]
-        bright_img = images[-1]
+        dark = images[0]
+        mid = images[len(images)//2]
+        bright = images[-1]
 
-        # 4) Scene detection
-        scene = detect_scene(images)
-        print(f"[Worker] Scene: {scene}")
-
-        # 5) Align
+        # Align + ghost suppression
         images = align_images(images)
-
-        # 6) Ghost remove
         images = remove_ghosts(images)
 
-        # 7) Fusion
+        # Fusion base
         fused = exposure_fusion(images)
 
-        # 8) Window pull
+        # Window pull (only if requested)
         if style == "window_strong":
-            fused = window_pull_strong(fused, dark_img)
+            fused = window_pull(fused, dark, strength=1.0)
         elif style == "window_soft":
-            fused = window_pull_soft(fused, dark_img)
+            fused = window_pull(fused, dark, strength=0.55)
 
-        # 9) Fix overall brightness
-        fused = auto_exposure(fused, target_mid=0.58 if scene == "interior" else 0.55)
+        # Normalize (prevents grey/dull output)
+        fused = normalize_exposure(fused, target_mid=0.60)
 
-        # 10) AWB
+        # Filmic contrast (clean, no crunchy HDR)
+        fused = filmic_contrast(fused, strength=0.33)
+
+        # White balance
         fused = balanced_awb(fused)
 
-        # 11) Gentle contrast
-        fused = apply_clahe(fused, scene)
+        # Local contrast (clarity)
+        fused = clarity(fused, amount=0.40)
 
-        # 12) Clean
-        fused = adaptive_denoise(fused)
+        # Mild color (MLS safe)
+        fused = mild_saturation(fused, sat_boost=0.08)
+
+        # Clean finishing
+        fused = denoise(fused)
         fused = sharpen_soft(fused)
 
-        elapsed = time.time() - start_time
-        print(f"[Worker] Complete in {elapsed:.1f}s. Output shape: {fused.shape}")
-
-        # Store output as a data URL so /result works
+        # Output to Redis as a data URL (so /result works)
         result_bytes = encode_jpeg(fused, FINAL_JPEG_QUALITY)
         output_url = to_data_url(result_bytes)
 
         redis_conn.hset(result_key, mapping={"status": "completed", "output_url": output_url})
         redis_conn.expire(result_key, 3600)
 
-        # Webhook
+        # Webhook send
         if webhook_url:
             webhook_bytes = encode_jpeg(fused, WEBHOOK_JPEG_QUALITY)
             webhook_payload = {
@@ -394,16 +379,15 @@ def process_job(payload: dict):
             }
             try:
                 send_webhook(webhook_url, webhook_secret, webhook_payload)
-                print(f"[Worker] Webhook sent to {webhook_url}")
+                print(f"[Worker] Webhook sent: {webhook_url}")
             except Exception as e:
                 print(f"[Worker] Webhook failed: {e}")
 
-        print(f"[Worker] Job {job_id} done.")
+        print(f"[Worker] Done {job_id} in {time.time()-start:.1f}s")
 
     except Exception as e:
-        elapsed = time.time() - start_time
-        error_msg = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"[Worker] Job {job_id} FAILED after {elapsed:.1f}s:\n{error_msg}")
+        err = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"[Worker] FAILED {job_id}:\n{err}")
 
         redis_conn.hset(result_key, mapping={"status": "failed", "error": str(e)})
         redis_conn.expire(result_key, 3600)
