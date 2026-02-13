@@ -1,7 +1,6 @@
 import os
 import uuid
 import redis
-import random
 from rq import Queue
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,22 +19,35 @@ app.add_middleware(
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 redis_conn = redis.from_url(REDIS_URL)
+
+# IMPORTANT: Must match the queue your worker listens to
 task_queue = Queue("hdr_jobs", connection=redis_conn)
+
+# Optional auth (set in Railway Variables). If blank, auth is disabled.
+SNAPFIX_API_KEY = os.environ.get("SNAPFIX_API_KEY", "")
 
 
 class HDRJobRequest(BaseModel):
+    # job id aliases
     jobId: Optional[str] = Field(None, alias="job_id")
     job_id_alt: Optional[str] = Field(None, alias="jobId")
 
+    # input urls aliases
     inputUrls: Optional[List[str]] = Field(None, alias="input_urls")
     input_urls_alt: Optional[List[str]] = Field(None, alias="inputUrls")
 
-    style: str = "natural"
+    # style options
+    # natural = clean MLS
+    # window_soft = safe window pull
+    # window_strong = aggressive window pull (halo guarded)
+    style: Literal["natural", "window_soft", "window_strong"] = "natural"
+
     resolution: str = "standard"
 
-    # NEW: order of exposures
-    order: Literal["as_provided", "dark-normal-bright", "random"] = "as_provided"
+    # exposure order option
+    order: Literal["random", "dark", "normal", "bright"] = "random"
 
+    # webhook aliases
     webhookUrl: Optional[str] = Field(None, alias="webhook_url")
     webhook_url_alt: Optional[str] = Field(None, alias="webhookUrl")
 
@@ -62,6 +74,15 @@ class HDRJobRequest(BaseModel):
         return self.webhookSecret or self.webhook_secret_alt
 
 
+def require_auth(request: Request):
+    if not SNAPFIX_API_KEY:
+        return
+    api_key_q = request.query_params.get("api_key")
+    api_key_h = request.headers.get("x-api-key")
+    if api_key_q != SNAPFIX_API_KEY and api_key_h != SNAPFIX_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "service": "snapfix-hdr-api"}
@@ -69,6 +90,8 @@ def health():
 
 @app.post("/v1/hdr/jobs")
 async def create_job(request: Request):
+    require_auth(request)
+
     raw = await request.json()
     job_data = HDRJobRequest(**raw)
 
@@ -78,22 +101,12 @@ async def create_job(request: Request):
     if len(input_urls) < 2:
         raise HTTPException(status_code=400, detail="At least 2 input URLs required")
 
-    # NEW: order handling
-    order = job_data.order
-    urls = list(input_urls)
-
-    if order == "random":
-        random.shuffle(urls)
-
-    # NOTE: "dark-normal-bright" assumes caller already passed in that order.
-    # If you want auto-detect darkest/brightest from images, we do it in worker after download.
-
     payload = {
         "job_id": job_id,
-        "input_urls": urls,
+        "input_urls": input_urls,
         "style": job_data.style,
         "resolution": job_data.resolution,
-        "order": order,
+        "order": job_data.order,
         "webhook_url": job_data.canonical_webhook_url,
         "webhook_secret": job_data.canonical_webhook_secret,
     }
@@ -103,9 +116,11 @@ async def create_job(request: Request):
         payload,
         job_id=f"hdr-{job_id}",
         job_timeout=900,
+        ttl=3600,
+        result_ttl=3600,
     )
 
-    print(f"[API] Enqueued job {job_id} with {len(urls)} inputs (order={order})")
+    print(f"[API] Enqueued job {job_id} ({len(input_urls)} imgs) style={job_data.style} order={job_data.order}")
 
     return {
         "jobId": job_id,
@@ -116,7 +131,9 @@ async def create_job(request: Request):
 
 
 @app.get("/v1/hdr/result/{job_id}")
-async def get_result(job_id: str):
+async def get_result(job_id: str, request: Request):
+    require_auth(request)
+
     job_key = f"hdr_result:{job_id}"
     result = redis_conn.hgetall(job_key)
 
@@ -128,8 +145,9 @@ async def get_result(job_id: str):
     if status == "completed":
         output_url = result.get(b"output_url", b"").decode()
         return {"status": "completed", "outputUrl": output_url, "jobId": job_id}
-    elif status == "failed":
+
+    if status == "failed":
         error = result.get(b"error", b"Unknown error").decode()
         return {"status": "failed", "error": error, "jobId": job_id}
-    else:
-        return {"status": status, "jobId": job_id}
+
+    return {"status": status, "jobId": job_id}
