@@ -5,7 +5,7 @@ from rq import Queue
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 app = FastAPI(title="SnapFix HDR API")
 
@@ -25,12 +25,21 @@ task_queue = Queue("hdr_jobs", connection=redis_conn)
 class HDRJobRequest(BaseModel):
     jobId: Optional[str] = Field(None, alias="job_id")
     job_id_alt: Optional[str] = Field(None, alias="jobId")
+
     inputUrls: Optional[List[str]] = Field(None, alias="input_urls")
     input_urls_alt: Optional[List[str]] = Field(None, alias="inputUrls")
+
     style: str = "natural"
     resolution: str = "standard"
+
+    # ✅ NEW: allow user to submit brackets in any order
+    # - "fixed": assumes given order is meaningful (your old behavior)
+    # - "random": API/worker will auto-detect dark/mid/bright
+    order: Literal["fixed", "random"] = "fixed"
+
     webhookUrl: Optional[str] = Field(None, alias="webhook_url")
     webhook_url_alt: Optional[str] = Field(None, alias="webhookUrl")
+
     webhookSecret: Optional[str] = Field(None, alias="webhook_secret")
     webhook_secret_alt: Optional[str] = Field(None, alias="webhookSecret")
 
@@ -75,6 +84,7 @@ async def create_job(request: Request):
         "input_urls": input_urls,
         "style": job_data.style,
         "resolution": job_data.resolution,
+        "order": job_data.order,  # ✅ NEW: worker can auto-sort if "random"
         "webhook_url": job_data.canonical_webhook_url,
         "webhook_secret": job_data.canonical_webhook_secret,
     }
@@ -86,13 +96,14 @@ async def create_job(request: Request):
         job_timeout=600,
     )
 
-    print(f"[API] Enqueued job {job_id} with {len(input_urls)} inputs")
+    print(f"[API] Enqueued job {job_id} with {len(input_urls)} inputs (order={job_data.order})")
 
     return {
         "jobId": job_id,
         "job_id": job_id,
         "status": "queued",
         "message": "Job enqueued for processing",
+        "order": job_data.order,
     }
 
 
