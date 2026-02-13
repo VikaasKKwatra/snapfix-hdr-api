@@ -1,158 +1,83 @@
 import os
-import io
-import cv2
-import json
 import time
 import redis
 import base64
 import requests
 import traceback
 import numpy as np
-from PIL import Image
-
+import cv2
 
 FINAL_JPEG_QUALITY = 97
 WEBHOOK_JPEG_QUALITY = 92
-
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 redis_conn = redis.from_url(REDIS_URL)
 
 
+# -------------------------
+# Utilities
+# -------------------------
+
 def download_image(url: str) -> np.ndarray:
-    resp = requests.get(url, timeout=120)
+    resp = requests.get(str(url), timeout=120)
     resp.raise_for_status()
     arr = np.frombuffer(resp.content, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError(f"Failed to decode image from URL")
+        raise ValueError("Failed to decode image from URL")
     return img
+
+
+def encode_jpeg(img: np.ndarray, quality: int) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+    if not ok:
+        raise ValueError("Failed to encode JPEG")
+    return buf.tobytes()
 
 
 def detect_scene(images: list) -> str:
     img = images[len(images) // 2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
+    _, s, v = cv2.split(hsv)
     mean_sat = float(np.mean(s))
-    mean_val = float(np.mean(v))
     bright_pct = float(np.sum(v > 200)) / v.size
     if bright_pct > 0.25 and mean_sat > 60:
         return "exterior"
     return "interior"
 
 
-def correct_lens(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-    fx = fy = max(w, h)
-    cx, cy = w / 2.0, h / 2.0
-    camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    dist_coeffs = np.array([-0.08, 0.02, 0, 0, 0], dtype=np.float64)
-    new_mtx, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 0.3, (w, h))
-    corrected = cv2.undistort(img, camera_matrix, dist_coeffs, None, new_mtx)
-    x, y, rw, rh = roi
-    if rw > w * 0.8 and rh > h * 0.8:
-        corrected = corrected[y:y+rh, x:x+rw]
-        corrected = cv2.resize(corrected, (w, h), interpolation=cv2.INTER_LANCZOS4)
-    return corrected
+# -------------------------
+# Bracket sorting (supports random order)
+# -------------------------
+
+def sort_brackets_by_exposure(images: list):
+    """
+    Sort by robust brightness score so we can reliably pick darkest/mid/bright
+    even when the upload order is random.
+    Returns: dark, mid, bright, sorted_images
+    """
+    if len(images) < 3:
+        # still works with 2, but window pull is limited
+        return images[0], images[len(images)//2], images[-1], images
+
+    scores = []
+    for i, img in enumerate(images):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        score = float(np.median(gray))  # robust against blown windows
+        scores.append((score, i))
+
+    scores_sorted = sorted(scores, key=lambda x: x[0])  # low -> high
+    sorted_images = [images[i] for _, i in scores_sorted]
+
+    dark = sorted_images[0]
+    bright = sorted_images[-1]
+    mid = sorted_images[len(sorted_images)//2]
+    return dark, mid, bright, sorted_images
 
 
-def remove_vignette(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-    Y, X = np.ogrid[:h, :w]
-    cx, cy = w / 2.0, h / 2.0
-    r = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    r_max = np.sqrt(cx**2 + cy**2)
-    r_norm = r / r_max
-    gain = 1.0 + 0.35 * (r_norm ** 2.5)
-    gain = np.clip(gain, 1.0, 1.6)
-    gain_3ch = np.dstack([gain, gain, gain]).astype(np.float32)
-    result = np.clip(img.astype(np.float32) * gain_3ch, 0, 255).astype(np.uint8)
-    return result
-
-
-def correct_perspective(img: np.ndarray, scene: str) -> np.ndarray:
-    """Straighten vertical lines using Hough transform + keystone correction."""
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 40, 120, apertureSize=3)
-
-    # Detect lines
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                            minLineLength=min(h, w) // 6, maxLineGap=12)
-    if lines is None or len(lines) < 4:
-        return img
-
-    # Collect near-vertical line angles (within 20° of vertical)
-    vert_angles = []
-    vert_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-        if length < min(h, w) // 8:
-            continue
-        angle = np.degrees(np.arctan2(x2 - x1, y2 - y1))  # angle from vertical
-        if abs(angle) < 20:
-            vert_angles.append(angle)
-            vert_lines.append((x1, y1, x2, y2, length))
-
-    # --- Step A: Rotation correction (straighten tilt) ---
-    if vert_angles:
-        # Weight by line length for more accurate median
-        weights = np.array([l[4] for l in vert_lines])
-        angles_arr = np.array(vert_angles)
-        sorted_idx = np.argsort(angles_arr)
-        cum_weights = np.cumsum(weights[sorted_idx])
-        median_idx = np.searchsorted(cum_weights, cum_weights[-1] / 2.0)
-        median_angle = float(angles_arr[sorted_idx[median_idx]])
-
-        # Apply rotation if tilt is between 0.15° and 8°
-        if 0.15 < abs(median_angle) < 8.0:
-            print(f"[Worker] Perspective: rotating {median_angle:.2f}°")
-            M = cv2.getRotationMatrix2D((w / 2, h / 2), median_angle, 1.0)
-            img = cv2.warpAffine(img, M, (w, h),
-                                 flags=cv2.INTER_LANCZOS4,
-                                 borderMode=cv2.BORDER_REFLECT)
-
-    # --- Step B: Keystone correction (converging verticals) ---
-    if len(vert_lines) >= 6:
-        left_lines = [(x1, y1, x2, y2) for x1, y1, x2, y2, l in vert_lines if (x1 + x2) / 2 < w * 0.4]
-        right_lines = [(x1, y1, x2, y2) for x1, y1, x2, y2, l in vert_lines if (x1 + x2) / 2 > w * 0.6]
-
-        if len(left_lines) >= 2 and len(right_lines) >= 2:
-            def avg_tilt(lines_subset):
-                tilts = [np.degrees(np.arctan2(x2 - x1, y2 - y1)) for x1, y1, x2, y2 in lines_subset]
-                return float(np.median(tilts))
-
-            left_tilt = avg_tilt(left_lines)
-            right_tilt = avg_tilt(right_lines)
-            convergence = left_tilt - right_tilt  # positive = converging at top
-
-            if abs(convergence) > 0.3 and abs(convergence) < 12.0:
-                # Apply perspective warp to correct keystone
-                shift = convergence * w / 800.0  # proportional shift
-                shift = np.clip(shift, -w * 0.03, w * 0.03)
-
-                src_pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-                dst_pts = np.float32([
-                    [shift, 0],
-                    [w - shift, 0],
-                    [w, h],
-                    [0, h]
-                ]) if convergence > 0 else np.float32([
-                    [0, 0],
-                    [w, 0],
-                    [w + shift, h],
-                    [-shift, h]
-                ])
-
-                M_persp = cv2.getPerspectiveTransform(src_pts, dst_pts)
-                img = cv2.warpPerspective(img, M_persp, (w, h),
-                                          flags=cv2.INTER_LANCZOS4,
-                                          borderMode=cv2.BORDER_REFLECT)
-                print(f"[Worker] Perspective: keystone correction {convergence:.2f}° (shift={shift:.1f}px)")
-
-    return img
-
+# -------------------------
+# Alignment / ghosting (your originals, kept)
+# -------------------------
 
 def align_images(images: list) -> list:
     if len(images) < 2:
@@ -177,7 +102,11 @@ def align_images(images: list) -> list:
             warp_matrix[0, 2] *= 2
             warp_matrix[1, 2] *= 2
             h, w = ref.shape[:2]
-            aligned_img = cv2.warpAffine(img, warp_matrix, (w, h), flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT)
+            aligned_img = cv2.warpAffine(
+                img, warp_matrix, (w, h),
+                flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REFLECT
+            )
             aligned.append(aligned_img)
         except Exception as e:
             print(f"[Worker] Alignment failed for image {i}, using original: {e}")
@@ -210,123 +139,140 @@ def remove_ghosts(images: list) -> list:
     return result
 
 
+# -------------------------
+# HDR merge (Mertens) - with more real-estate friendly weights
+# -------------------------
+
 def exposure_fusion(images: list) -> np.ndarray:
+    # These weights reduce color weirdness + reduce crunchy contrast
     merge = cv2.createMergeMertens(
-        contrast_weight=1.0,
-        saturation_weight=0.8,
-        exposure_weight=0.6,
+        contrast_weight=0.9,
+        saturation_weight=0.55,
+        exposure_weight=0.95,
     )
-    fusion = merge.process(images)
+    fusion = merge.process(images)  # float32 0..1-ish
     fusion = np.clip(fusion * 255, 0, 255).astype(np.uint8)
     return fusion
 
 
-def recover_highlights_shadows(fused: np.ndarray, dark: np.ndarray) -> np.ndarray:
-    lab_fused = cv2.cvtColor(fused, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab_dark = cv2.cvtColor(dark, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L_fused = lab_fused[:, :, 0]
-    L_dark = lab_dark[:, :, 0]
-    highlight_mask = np.clip((L_fused - 200) / 55.0, 0, 1)
-    lab_fused[:, :, 0] = L_fused * (1 - highlight_mask * 0.4) + L_dark * (highlight_mask * 0.4)
-    shadow_mask = np.clip((60 - lab_fused[:, :, 0]) / 60.0, 0, 1)
-    lab_fused[:, :, 0] += shadow_mask * 15
-    lab_fused[:, :, 0] = np.clip(lab_fused[:, :, 0], 0, 255)
-    return cv2.cvtColor(lab_fused.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def tone_map_lab(img: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L = lab[:, :, 0] / 255.0
-    L = np.power(L, 0.91)
-    mid = 0.5
-    strength = 0.50
-    L = mid + (L - mid) * (1 + strength * (0.5 - np.abs(L - mid)))
-    lab[:, :, 0] = np.clip(L * 255, 0, 255)
-    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
+# -------------------------
+# Finishing (new: window pull + natural look)
+# -------------------------
 
 def balanced_awb(img: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
     a_mean = float(np.mean(A))
     b_mean = float(np.mean(B))
-    strength = 0.12
+    strength = 0.10  # slightly gentler than your 0.12
     A = A - (a_mean - 128) * strength
     B = B - (b_mean - 128) * strength
-    B = np.clip(B, 128 - 8, 128 + 3)
+    # keep B closer to neutral to prevent yellow/green shifts
+    B = np.clip(B, 128 - 7, 128 + 3)
     lab = cv2.merge([L, np.clip(A, 0, 255), np.clip(B, 0, 255)])
     return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
-def preserve_surface_tones(original: np.ndarray, processed: np.ndarray) -> np.ndarray:
-    lab_orig = cv2.cvtColor(original, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab_proc = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L_orig = lab_orig[:, :, 0]
-    a_orig = lab_orig[:, :, 1]
-    b_orig = lab_orig[:, :, 2]
-    chroma = np.sqrt((a_orig - 128)**2 + (b_orig - 128)**2)
-    neutral_mask = np.clip(1.0 - chroma / 30.0, 0, 1)
-    neutral_mask = cv2.GaussianBlur(neutral_mask, (31, 31), 0)
-    blend_strength = 0.3
-    alpha = neutral_mask * blend_strength
-    alpha_3ch = np.dstack([alpha, alpha, alpha])
-    lab_result = lab_proc * (1 - alpha_3ch) + lab_orig * alpha_3ch
-    lab_result = np.clip(lab_result, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(lab_result, cv2.COLOR_LAB2BGR)
+def lift_mids(img: np.ndarray, gamma=0.92, exposure=0.06) -> np.ndarray:
+    """
+    Brighten interiors without halos (replaces CLAHE).
+    gamma < 1 brightens midtones.
+    """
+    x = img.astype(np.float32) / 255.0
+    x = np.clip(x + exposure, 0, 1)
+    x = np.power(x, gamma)
+    return np.clip(x * 255, 0, 255).astype(np.uint8)
 
 
-def apply_clahe(img: np.ndarray, scene: str) -> np.ndarray:
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    clip_limit = 1.5 if scene == "interior" else 1.8
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    L = clahe.apply(L)
-    return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
+def window_pull_blend(fused: np.ndarray, darkest: np.ndarray) -> np.ndarray:
+    """
+    Softly blend darkest exposure into bright window regions to recover detail
+    WITHOUT halos.
+    """
+    fused_f = fused.astype(np.float32) / 255.0
+    dark_f = darkest.astype(np.float32) / 255.0
+
+    # luminance of fused
+    lum = 0.2126 * fused_f[:, :, 2] + 0.7152 * fused_f[:, :, 1] + 0.0722 * fused_f[:, :, 0]
+
+    # soft highlight mask (tune start/end)
+    start, end = 0.78, 0.94
+    mask = (lum - start) / (end - start)
+    mask = np.clip(mask, 0.0, 1.0)
+
+    # heavy feathering removes halos
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=10)
+    mask3 = np.dstack([mask, mask, mask])
+
+    out = fused_f * (1 - mask3) + dark_f * mask3
+
+    # desaturate highlights a bit (prevents neon windows)
+    hsv = cv2.cvtColor((out * 255).astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] *= (1 - 0.20 * mask)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+    out2 = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
+
+    return np.clip(out2 * 255, 0, 255).astype(np.uint8)
 
 
-def dehaze(img: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L = lab[:, :, 0]
-    blur = cv2.GaussianBlur(L, (0, 0), sigmaX=40)
-    detail = L - blur
-    L = L + detail * 0.2
-    lab[:, :, 0] = np.clip(L, 0, 255)
-    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+def mild_denoise(img: np.ndarray, scene: str) -> np.ndarray:
+    # interiors benefit from mild denoise; exteriors less
+    if scene == "interior":
+        return cv2.fastNlMeansDenoisingColored(img, None, 1, 1, 7, 21)
+    return img
 
 
-def adaptive_denoise(img: np.ndarray) -> np.ndarray:
-    return cv2.fastNlMeansDenoisingColored(img, None, 2, 2, 7, 21)
+def safe_sharpen_edges(img: np.ndarray, amount=0.30, radius=1.10) -> np.ndarray:
+    """
+    Sharpen only where there are real edges (prevents crunchy walls and halos).
+    """
+    base = img.astype(np.float32)
+
+    blur = cv2.GaussianBlur(base, (0, 0), sigmaX=radius)
+    sharp = cv2.addWeighted(base, 1 + amount, blur, -amount, 0)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 140)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    edges = cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (0, 0), 1.2)
+    edges3 = np.dstack([edges, edges, edges])
+
+    out = base * (1 - edges3) + sharp * edges3
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def sharpen(img: np.ndarray) -> np.ndarray:
-    """Multi-scale unsharp mask with stronger weights for architectural detail."""
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
+# -------------------------
+# Webhook helper
+# -------------------------
 
-    # Fine detail pass (sigma=1.0) — stronger
-    blur1 = cv2.GaussianBlur(L, (0, 0), sigmaX=1.0)
-    sharp_fine = cv2.addWeighted(L, 1.5, blur1, -0.5, 0)
+def send_webhook(webhook_url: str, webhook_secret: str, job_id: str, fused: np.ndarray):
+    webhook_bytes = encode_jpeg(fused, WEBHOOK_JPEG_QUALITY)
+    b64 = base64.b64encode(webhook_bytes).decode("utf-8")
+    webhook_payload = {
+        "jobId": job_id,
+        "status": "completed",
+        "result": b64,
+    }
+    headers = {"Content-Type": "application/json"}
+    if webhook_secret:
+        headers["x-webhook-secret"] = webhook_secret
 
-    # Mid-frequency pass (sigma=2.0) — stronger
-    blur2 = cv2.GaussianBlur(sharp_fine, (0, 0), sigmaX=2.0)
-    sharp_mid = cv2.addWeighted(sharp_fine, 1.25, blur2, -0.25, 0)
-
-    # Coarse structure pass (sigma=4.0) — new, for edge crispness
-    blur3 = cv2.GaussianBlur(sharp_mid, (0, 0), sigmaX=4.0)
-    sharp_coarse = cv2.addWeighted(sharp_mid, 1.1, blur3, -0.1, 0)
-
-    return cv2.cvtColor(cv2.merge([sharp_coarse, A, B]), cv2.COLOR_LAB2BGR)
+    resp = requests.post(webhook_url, json=webhook_payload, headers=headers, timeout=120)
+    return resp.status_code
 
 
-def encode_jpeg(img: np.ndarray, quality: int) -> bytes:
-    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return buf.tobytes()
-
+# -------------------------
+# Main job runner
+# -------------------------
 
 def process_job(payload: dict):
     job_id = payload["job_id"]
     input_urls = payload["input_urls"]
     style = payload.get("style", "natural")
+
+    # ✅ NEW: supports fixed vs random order
+    order = payload.get("order", "fixed")  # "fixed" or "random"
+
     webhook_url = payload.get("webhook_url")
     webhook_secret = payload.get("webhook_secret")
 
@@ -334,105 +280,90 @@ def process_job(payload: dict):
     redis_conn.hset(result_key, mapping={"status": "processing"})
     redis_conn.expire(result_key, 3600)
 
-    print(f"[Worker] Processing job {job_id} with {len(input_urls)} images, style={style}")
+    print(f"[Worker] Processing job {job_id} with {len(input_urls)} images, style={style}, order={order}")
     start_time = time.time()
 
     try:
         # Step 1: Download
-        print(f"[Worker] Step 1/16: Downloading {len(input_urls)} images...")
+        print(f"[Worker] Step 1: Downloading {len(input_urls)} images...")
         images = [download_image(url) for url in input_urls]
-        print(f"[Worker] Downloaded. Sizes: {[img.shape for img in images]}")
+        print(f"[Worker] Downloaded sizes: {[img.shape for img in images]}")
 
-        # Step 2: Scene detection
-        print("[Worker] Step 2/16: Scene detection...")
+        # Step 2: If random, sort brackets so we know which is darkest
+        if order == "random":
+            dark, mid, bright, images = sort_brackets_by_exposure(images)
+            print("[Worker] Order=random -> auto-sorted brackets by exposure.")
+        else:
+            # fixed: assume first is darkest, last is brightest, mid is middle
+            dark = images[0]
+            mid = images[len(images)//2]
+            bright = images[-1]
+
+        # Step 3: Scene detection (use mid)
         scene = detect_scene(images)
         print(f"[Worker] Scene: {scene}")
 
-        # Step 3: Lens correction
-        print("[Worker] Step 3/16: Lens correction...")
-        images = [correct_lens(img) for img in images]
-
-        # Step 4: Vignette removal
-        print("[Worker] Step 4/16: Vignette removal...")
-        images = [remove_vignette(img) for img in images]
-
-        # Step 5: Perspective correction
-        print("[Worker] Step 5/16: Perspective correction...")
-        images = [correct_perspective(img, scene) for img in images]
-
-        # Step 6: Sub-pixel alignment
-        print("[Worker] Step 6/16: Sub-pixel ECC alignment...")
+        # Step 4: Alignment (better to align before any aggressive geometry changes)
+        print("[Worker] Step 2: ECC alignment...")
         images = align_images(images)
 
-        # Step 7: Ghost removal
-        print("[Worker] Step 7/16: Ghost removal...")
-        images = remove_ghosts(images)
+        # Re-pick dark/mid/bright after alignment (same indices)
+        if order == "random":
+            dark, mid, bright, images = sort_brackets_by_exposure(images)
+        else:
+            dark = images[0]
+            mid = images[len(images)//2]
+            bright = images[-1]
 
-        # Step 8: Exposure fusion
-        print("[Worker] Step 8/16: Exposure fusion (Mertens)...")
-        pre_fusion_lab = cv2.cvtColor(images[len(images)//2], cv2.COLOR_BGR2LAB).astype(np.float32)
+        # Step 5: Ghost removal (optional)
+        if len(images) >= 3:
+            print("[Worker] Step 3: Ghost removal...")
+            images = remove_ghosts(images)
+
+        # Step 6: Exposure fusion
+        print("[Worker] Step 4: Exposure fusion (Mertens)...")
         fused = exposure_fusion(images)
 
-        # Step 9: Highlight/shadow recovery
-        print("[Worker] Step 9/16: Highlight & shadow recovery...")
-        dark_img = images[0]
-        fused = recover_highlights_shadows(fused, dark_img)
-
-        # Step 10: LAB tone mapping
-        print("[Worker] Step 10/16: LAB tone mapping...")
-        fused = tone_map_lab(fused)
-
-        # Step 11: Balanced AWB
-        print("[Worker] Step 11/16: Balanced AWB...")
+        # Step 7: AWB (gentle)
+        print("[Worker] Step 5: Balanced AWB...")
         fused = balanced_awb(fused)
 
-        # Step 12: Surface tone preservation
-        print("[Worker] Step 12/16: Surface tone preservation...")
-        fused = preserve_surface_tones(images[len(images)//2], fused)
+        # Step 8: Brightness lift (fix too-dark interiors without halos)
+        print("[Worker] Step 6: Midtone lift (no CLAHE)...")
+        if scene == "interior":
+            fused = lift_mids(fused, gamma=0.92, exposure=0.06)
+        else:
+            fused = lift_mids(fused, gamma=0.96, exposure=0.03)
 
-        # Step 13: CLAHE contrast
-        print("[Worker] Step 13/16: Edge-aware contrast (CLAHE)...")
-        fused = apply_clahe(fused, scene)
+        # Step 9: Window pull (fix blown windows WITHOUT halos/crunch)
+        print("[Worker] Step 7: Window pull blend...")
+        fused = window_pull_blend(fused, dark)
 
-        # Step 14: Dehaze
-        print("[Worker] Step 14/16: Dehazing...")
-        fused = dehaze(fused)
+        # Step 10: Mild denoise
+        print("[Worker] Step 8: Mild denoise...")
+        fused = mild_denoise(fused, scene)
 
-        # Step 15: Adaptive denoise
-        print("[Worker] Step 15/16: Adaptive denoising...")
-        fused = adaptive_denoise(fused)
-
-        # Step 16: Multi-scale sharpening
-        print("[Worker] Step 16/16: Multi-scale sharpening...")
-        fused = sharpen(fused)
+        # Step 11: Safe edge sharpening (no crunchy walls)
+        print("[Worker] Step 9: Safe edge sharpening...")
+        fused = safe_sharpen_edges(fused, amount=0.30, radius=1.10)
 
         elapsed = time.time() - start_time
-        print(f"[Worker] Processing complete in {elapsed:.1f}s. Output shape: {fused.shape}")
+        print(f"[Worker] Complete in {elapsed:.1f}s. Output shape: {fused.shape}")
 
-        # Encode result
+        # Encode/store result
         result_bytes = encode_jpeg(fused, FINAL_JPEG_QUALITY)
-        print(f"[Worker] Final JPEG size: {len(result_bytes) / 1024:.0f} KB")
+        print(f"[Worker] Final JPEG size: {len(result_bytes)/1024:.0f} KB")
 
-        # Send webhook
+        # Webhook
         if webhook_url:
-            print(f"[Worker] Sending webhook to {webhook_url}")
-            webhook_bytes = encode_jpeg(fused, WEBHOOK_JPEG_QUALITY)
-            b64 = base64.b64encode(webhook_bytes).decode("utf-8")
-            webhook_payload = {
-                "jobId": job_id,
-                "status": "completed",
-                "result": b64,
-            }
-            headers = {"Content-Type": "application/json"}
-            if webhook_secret:
-                headers["x-webhook-secret"] = webhook_secret
             try:
-                resp = requests.post(webhook_url, json=webhook_payload, headers=headers, timeout=120)
-                print(f"[Worker] Webhook response: {resp.status_code}")
+                print(f"[Worker] Sending webhook to {webhook_url}")
+                code = send_webhook(webhook_url, webhook_secret, job_id, fused)
+                print(f"[Worker] Webhook response: {code}")
             except Exception as e:
                 print(f"[Worker] Webhook failed: {e}")
 
-        # Store in Redis
+        # Store status (keep same behavior as your API expects)
         redis_conn.hset(result_key, mapping={"status": "completed", "output_url": "webhook_delivered"})
         redis_conn.expire(result_key, 3600)
         print(f"[Worker] Job {job_id} done.")
@@ -449,6 +380,11 @@ def process_job(payload: dict):
                 headers = {"Content-Type": "application/json"}
                 if webhook_secret:
                     headers["x-webhook-secret"] = webhook_secret
-                requests.post(webhook_url, json={"jobId": job_id, "status": "failed", "error": str(e)}, headers=headers, timeout=30)
+                requests.post(
+                    webhook_url,
+                    json={"jobId": job_id, "status": "failed", "error": str(e)},
+                    headers=headers,
+                    timeout=30
+                )
             except Exception:
                 pass
