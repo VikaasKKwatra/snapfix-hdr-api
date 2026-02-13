@@ -191,24 +191,109 @@ def exposure_fusion_better(images: list) -> np.ndarray:
     fusion01 = merge.process(imgs01)
     return to_uint8(fusion01)
 
-def window_pull(fused: np.ndarray, dark: np.ndarray, mid: np.ndarray) -> np.ndarray:
-    Lmid = luminance_L(mid)
-    t = np.percentile(Lmid, 92)  # top brightest
-    mask = (Lmid >= t).astype(np.uint8) * 255
+def window_pull_soft(fused: np.ndarray, dark: np.ndarray) -> np.ndarray:
+    """
+    Soft window recovery:
+    - mask from fused highlights
+    - small coverage target (prevents darkening the whole image)
+    """
+    L = luminance_L(fused)
 
+    # Start high; keep mask small
+    t = np.percentile(L, 96)
+    mask = (L >= t).astype(np.uint8) * 255
+
+    # Feathered mask to avoid halos
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
-    mask = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=2)
-
-    # feather a lot to avoid halos
+    mask = cv2.dilate(mask, np.ones((13, 13), np.uint8), iterations=2)
     mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=18)
     mask_f = np.clip(mask_f, 0.0, 1.0)
 
-    fused_f = fused.astype(np.float32)
-    dark_f = dark.astype(np.float32)
-    m3 = np.dstack([mask_f, mask_f, mask_f])
+    # Safety: never let mask cover too much
+    if float(np.mean(mask_f)) > 0.18:
+        # tighten threshold
+        t = np.percentile(L, 98)
+        mask = (L >= t).astype(np.uint8) * 255
+        mask = cv2.dilate(mask, np.ones((11, 11), np.uint8), iterations=1)
+        mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=18)
+        mask_f = np.clip(mask_f, 0.0, 1.0)
 
-    out = fused_f * (1.0 - m3) + dark_f * m3
+    m3 = np.dstack([mask_f, mask_f, mask_f])
+    out = fused.astype(np.float32) * (1.0 - m3) + dark.astype(np.float32) * m3
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def window_pull_strong(fused: np.ndarray, dark: np.ndarray) -> np.ndarray:
+    """
+    Strong window recovery (aggressive) but SAFE:
+    - mask from fused highlights
+    - adaptive threshold so mask coverage stays small
+    - heavy feather to avoid halos/crunch
+    """
+    L = luminance_L(fused)
+
+    # We want only real blown areas, not ceiling/walls.
+    # Target: mask coverage ~ 5% to 14% (depends on shot)
+    target_max = 0.14
+
+    # Start threshold a bit lower than soft, but not crazy.
+    t = np.percentile(L, 94)
+
+    # Auto-tighten if mask too big
+    for _ in range(6):
+        mask = (L >= t).astype(np.uint8) * 255
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8), iterations=1)
+        mask = cv2.dilate(mask, np.ones((17, 17), np.uint8), iterations=2)
+        mask_f = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=24)
+        mask_f = np.clip(mask_f, 0.0, 1.0)
+
+        coverage = float(np.mean(mask_f))
+        if coverage <= target_max:
+            break
+
+        # mask too big -> tighten threshold (more selective)
+        t = min(t + 1.5, 99.2)
+
+    # Final feather again (extra anti-halo)
+    mask_f = cv2.GaussianBlur(mask_f, (0, 0), sigmaX=10)
+    mask_f = np.clip(mask_f, 0.0, 1.0)
+
+    # Use slightly more dark in the window region (aggressive pull)
+    bias = 0.90
+    m = mask_f * bias
+
+    m3 = np.dstack([m, m, m])
+    out = fused.astype(np.float32) * (1.0 - m3) + dark.astype(np.float32) * m3
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def auto_exposure(img: np.ndarray, target_mid: float = 0.58) -> np.ndarray:
+    """
+    Fix "too dark overall":
+    - higher gain ceiling so it can recover after window pull
+    - still prevents blowing out
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L = lab[:, :, 0] / 255.0
+
+    med = float(np.median(L))
+    med = max(med, 1e-4)
+
+    gain = target_mid / med
+
+    # IMPORTANT: allow more lift than before
+    gain = np.clip(gain, 0.75, 2.60)
+
+    L = np.clip(L * gain, 0, 1)
+
+    # mild shadow lift if very dark
+    if med < 0.40:
+        L = np.power(L, 0.88)
+
+    lab[:, :, 0] = L * 255.0
+    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
 
 def auto_exposure(img: np.ndarray, target_mid: float = 0.58) -> np.ndarray:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
