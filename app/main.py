@@ -1,6 +1,7 @@
 import os
 import uuid
 import redis
+import random
 from rq import Queue
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,10 +33,8 @@ class HDRJobRequest(BaseModel):
     style: str = "natural"
     resolution: str = "standard"
 
-    # ✅ NEW: allow user to submit brackets in any order
-    # - "fixed": assumes given order is meaningful (your old behavior)
-    # - "random": API/worker will auto-detect dark/mid/bright
-    order: Literal["fixed", "random"] = "fixed"
+    # NEW: order of exposures
+    order: Literal["as_provided", "dark-normal-bright", "random"] = "as_provided"
 
     webhookUrl: Optional[str] = Field(None, alias="webhook_url")
     webhook_url_alt: Optional[str] = Field(None, alias="webhookUrl")
@@ -79,12 +78,22 @@ async def create_job(request: Request):
     if len(input_urls) < 2:
         raise HTTPException(status_code=400, detail="At least 2 input URLs required")
 
+    # NEW: order handling
+    order = job_data.order
+    urls = list(input_urls)
+
+    if order == "random":
+        random.shuffle(urls)
+
+    # NOTE: "dark-normal-bright" assumes caller already passed in that order.
+    # If you want auto-detect darkest/brightest from images, we do it in worker after download.
+
     payload = {
         "job_id": job_id,
-        "input_urls": input_urls,
+        "input_urls": urls,
         "style": job_data.style,
         "resolution": job_data.resolution,
-        "order": job_data.order,  # ✅ NEW: worker can auto-sort if "random"
+        "order": order,
         "webhook_url": job_data.canonical_webhook_url,
         "webhook_secret": job_data.canonical_webhook_secret,
     }
@@ -93,17 +102,16 @@ async def create_job(request: Request):
         "app.worker.process_job",
         payload,
         job_id=f"hdr-{job_id}",
-        job_timeout=600,
+        job_timeout=900,
     )
 
-    print(f"[API] Enqueued job {job_id} with {len(input_urls)} inputs (order={job_data.order})")
+    print(f"[API] Enqueued job {job_id} with {len(urls)} inputs (order={order})")
 
     return {
         "jobId": job_id,
         "job_id": job_id,
         "status": "queued",
         "message": "Job enqueued for processing",
-        "order": job_data.order,
     }
 
 
