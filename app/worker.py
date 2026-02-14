@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 
 FINAL_JPEG_QUALITY = 97
-WEBHOOK_JPEG_QUALITY = 92
+WEBHOOK_JPEG_QUALITY = 97
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 redis_conn = redis.from_url(REDIS_URL)
