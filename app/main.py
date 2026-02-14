@@ -151,3 +151,62 @@ async def get_result(job_id: str, request: Request):
         return {"status": "failed", "error": error, "jobId": job_id}
 
     return {"status": status, "jobId": job_id}
+import io
+import rawpy
+import numpy as np
+import cv2
+import requests as http_requests
+
+
+@app.post("/v1/convert-raw")
+async def convert_raw(request: Request):
+    require_auth(request)
+
+    body = await request.json()
+    raw_url = body.get("rawUrl") or body.get("raw_url")
+    quality = int(body.get("quality", 97))
+
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="Missing rawUrl")
+
+    print(f"[Convert] Downloading RAW from URL ({len(raw_url)} chars)...")
+
+    resp = http_requests.get(raw_url, timeout=300)
+    resp.raise_for_status()
+    raw_bytes = resp.content
+    print(f"[Convert] Downloaded {len(raw_bytes) / 1024 / 1024:.1f}MB RAW file")
+
+    try:
+        raw = rawpy.imread(io.BytesIO(raw_bytes))
+        rgb = raw.postprocess(
+            use_camera_wb=True,
+            half_size=False,
+            no_auto_bright=False,
+            output_bps=8,
+            demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+        )
+        raw.close()
+    except Exception as e:
+        print(f"[Convert] rawpy failed: {e}")
+        raise HTTPException(status_code=422, detail=f"Failed to decode RAW file: {str(e)}")
+
+    print(f"[Convert] Rendered: {rgb.shape[1]}x{rgb.shape[0]} pixels")
+
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, jpeg_buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise HTTPException(status_code=500, detail="JPEG encoding failed")
+
+    jpeg_bytes = jpeg_buf.tobytes()
+    print(f"[Convert] Output JPEG: {len(jpeg_bytes) / 1024 / 1024:.1f}MB at q={quality}")
+
+    from fastapi.responses import Response
+    return Response(
+        content=jpeg_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Content-Length": str(len(jpeg_bytes)),
+            "X-Image-Width": str(rgb.shape[1]),
+            "X-Image-Height": str(rgb.shape[0]),
+        },
+    )
